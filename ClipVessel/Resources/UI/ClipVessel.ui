@@ -97,16 +97,55 @@
         <item>
          <widget class="qSlicerMarkupsPlaceWidget" name="clipPointsMarkupsPlaceWidget"/>
         </item>
+        <item>
+         <widget class="QPushButton" name="detectClipPointsButton">
+          <property name="toolTip">
+           <string>Replace the clip points above with one point per centerline terminus (the inlet and every branch outlet), each pulled inward from the vessel surface so the clip plane is positioned correctly without manual dragging.</string>
+          </property>
+          <property name="text">
+           <string>Detect from centerline</string>
+          </property>
+         </widget>
+        </item>
        </layout>
       </item>
       <item row="4" column="0">
+       <widget class="QLabel" name="clipPointInsetLabel">
+        <property name="text">
+         <string>Clip point inset (x radius):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="1">
+       <widget class="ctkSliderWidget" name="clipPointInsetFactorWidget">
+        <property name="toolTip">
+         <string>When detecting clip points from the centerline, each point is pulled inward from the vessel surface by this many times the local vessel radius.</string>
+        </property>
+        <property name="decimals">
+         <number>2</number>
+        </property>
+        <property name="singleStep">
+         <double>0.050000000000000</double>
+        </property>
+        <property name="minimum">
+         <double>0.000000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>10.000000000000000</double>
+        </property>
+        <property name="value">
+         <double>0.500000000000000</double>
+        </property>
+       </widget>
+      </item>
+      <item row="5" column="0">
        <widget class="QLabel" name="label_10">
         <property name="text">
          <string>Cap output surface:</string>
         </property>
        </widget>
       </item>
-      <item row="4" column="1">
+      <item row="5" column="1">
        <widget class="QCheckBox" name="capOutputSurfaceModelCheckBox">
         <property name="toolTip">
          <string>Cap clipped ends of model</string>
@@ -116,6 +155,26 @@
         </property>
         <property name="checked">
          <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="6" column="0">
+       <widget class="QLabel" name="label_12">
+        <property name="text">
+         <string>Snap clip points to centerline:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="6" column="1">
+       <widget class="QCheckBox" name="snapClipPointsToCenterlineCheckBox">
+        <property name="toolTip">
+         <string>While dragging a clip point, snap it onto the centerline model. When unchecked, clip points snap to the visible surface model instead (Slicer's default markup placement behavior).</string>
+        </property>
+        <property name="text">
+         <string/>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
         </property>
        </widget>
       </item>
@@ -239,6 +298,25 @@
          <bool>true</bool>
         </property>
         <property name="renameEnabled">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="toggleOutputVisibilityButton">
+        <property name="enabled">
+         <bool>false</bool>
+        </property>
+        <property name="toolTip">
+         <string>Show or hide the output surface model</string>
+        </property>
+        <property name="text">
+         <string>Hide output</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+        <property name="checked">
          <bool>true</bool>
         </property>
        </widget>
@@ -467,7 +545,7 @@
 		</property>
 	   </widget>
 	  </item>
-	  <item row="7" column="1" colspan="3">
+		  <item row="7" column="1" colspan="3">
 	   <widget class="QComboBox" name="extensionModeComboBox">
 		<property name="toolTip">
 		 <string>Mode for adding flow extension</string>
@@ -475,12 +553,49 @@
 		<property name="editable">
 		 <bool>false</bool>
 		</property>
-	   </widget>
-	  </item>
+		   </widget>
+		  </item>
      </layout>
     </widget>
    </item>
+   <item row="4" column="0" colspan="2">
+    <widget class="QLabel" name="clipPlaneInstructionsLabel">
+     <property name="text">
+      <string>Click a centerline endpoint in a view to show and adjust its point-normal clip plane.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item row="5" column="0">
+    <widget class="QLabel" name="autoApplyPlaneLabel">
+     <property name="text">
+      <string>Auto apply plane changes:</string>
+     </property>
+    </widget>
+   </item>
+   <item row="5" column="1">
+    <widget class="QCheckBox" name="autoApplyPlaneCheckBox">
+     <property name="toolTip">
+      <string>Recompute the clipped and capped surface when a point or normal handle is released.</string>
+     </property>
+     <property name="checked">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
    <item row="6" column="0" colspan="2">
+    <widget class="QLabel" name="clipStatusLabel">
+     <property name="text">
+      <string/>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item row="7" column="0" colspan="2">
     <widget class="QPushButton" name="applyButton">
      <property name="toolTip">
       <string>Run the algorithm.</string>
