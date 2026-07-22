@@ -298,6 +298,17 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.updateParameterNodeFromGUI()
     self.updateClipPointsSnapMode()
 
+  def snapOriginToCenterline(self, origin):
+    """Return origin snapped onto the input centerline, or origin unchanged if centerline
+    snapping is disabled, no centerline is set, or the centerline has no points."""
+    if not self.ui.snapClipPointsToCenterlineCheckBox.checked:
+        return origin
+    centerlinesNode = self._parameterNode.GetNodeReference("InputCenterlines")
+    if not centerlinesNode:
+        return origin
+    snappedOrigin = self.logic.closestPointOnCenterline(centerlinesNode, origin)
+    return snappedOrigin if snappedOrigin is not None else origin
+
   def updateClipPointsSnapMode(self):
     """When centerline-snapping is enabled, custom logic in onClipPointModified() takes over
     positioning, so the native display-node snap mode is left unconstrained. When disabled,
@@ -458,7 +469,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self._normalHandleDistance = max(radius * 2.0, 1.0)
 
     self._activeClipPointIndex = pointIndex
-    self._updatingInteractivePlane = True
+    self._updatingInteractivePlane = True  # suppress re-entrant modified events during setup
     wasModify = planeNode.StartModify()
     planeNode.RemoveAllControlPoints()
     planeNode.SetPlaneType(slicer.vtkMRMLMarkupsPlaneNode.PlaneTypePointNormal)
@@ -500,11 +511,16 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     if not clipPointsNode or self._activeClipPointIndex >= clipPointsNode.GetNumberOfControlPoints():
         return
     origin, normal = self.logic.manualPlaneOriginNormal(caller)
+    # The plane markup's control point sits on top of the clip-point fiducial, so dragging the
+    # plane lands here instead of in onClipPointModified; snap it the same way so it stays on the
+    # centerline rather than being pulled onto the input surface.
+    origin = self.snapOriginToCenterline(origin)
     pointId = clipPointsNode.GetNthControlPointID(self._activeClipPointIndex)
     self._manualPlaneOrigins[pointId] = list(origin)
     self._manualPlaneNormals[pointId] = list(normal)
-    self._updatingInteractivePlane = True
+    self._updatingInteractivePlane = True  # suppress re-entrant modified events from our writes
     clipPointsNode.SetNthControlPointPositionWorld(self._activeClipPointIndex, origin)
+    caller.SetOriginWorld(origin)  # keep the plane on the snapped origin too
     self.repositionNormalHandle(origin, normal)
     self._updatingInteractivePlane = False
 
@@ -516,18 +532,10 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         return
     origin = [0.0, 0.0, 0.0]
     caller.GetNthControlPointPositionWorld(self._activeClipPointIndex, origin)
+    # Keep the dragged point on the centerline (no-op when snapping is disabled).
+    origin = self.snapOriginToCenterline(origin)
 
-    # Snap the clip point onto the centerline model itself, rather than letting it float
-    # off the line while being dragged. Only do this when the user has enabled centerline
-    # snapping; otherwise the display node's native SnapModeToVisibleSurface handles it.
-    if self.ui.snapClipPointsToCenterlineCheckBox.checked:
-        centerlinesNode = self._parameterNode.GetNodeReference("InputCenterlines")
-        if centerlinesNode:
-            snappedOrigin = self.logic.closestPointOnCenterline(centerlinesNode, origin)
-            if snappedOrigin is not None:
-                origin = snappedOrigin
-
-    self._updatingInteractivePlane = True
+    self._updatingInteractivePlane = True  # suppress re-entrant modified events from our writes
     caller.SetNthControlPointPositionWorld(self._activeClipPointIndex, origin)
     planeNode.SetOriginWorld(origin)
     normal = [0.0, 0.0, 1.0]
@@ -836,6 +844,8 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         parameterNode.SetParameter("PreprocessInputSurface", "true")
     if not parameterNode.GetParameter("SubdivideInputSurface"):
         parameterNode.SetParameter("SubdivideInputSurface", "false")
+    if not parameterNode.GetParameter("CapOutputSurface"):
+        parameterNode.SetParameter("CapOutputSurface", "true")
     if not parameterNode.GetParameter("ExtensionLength"):
         parameterNode.SetParameter("ExtensionLength", "5")
     if not parameterNode.GetParameter("ManualClipPlaneNormals"):
