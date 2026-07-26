@@ -63,6 +63,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self._preprocessedPolyData = None
     self._applying = False
     self._clipPointDragStartPosition = None
+    self.autoApplyTimer = None
 
   def setup(self):
     """
@@ -93,6 +94,12 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     self.logic = ClipVesselLogic()
     self.ui.parameterNodeSelector.addAttribute("vtkMRMLScriptedModuleNode", "ModuleName", self.moduleName)
+
+    self.autoApplyTimer = qt.QTimer()
+    self.autoApplyTimer.setSingleShot(True)
+    self.autoApplyTimer.setInterval(60)
+    self.autoApplyTimer.connect("timeout()", self.onAutoApplyTimeout)
+
     self.setParameterNode(self.logic.getParameterNode())
 
     # Connections
@@ -129,6 +136,8 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     Called when the application closes and the module widget is destroyed.
     """
     self.removeObservers()
+    if self.autoApplyTimer:
+        self.autoApplyTimer.stop()
 
   def setParameterNode(self, inputParameterNode):
     """
@@ -693,6 +702,10 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     if (not self._applying and not self.updatingGUIFromParameterNode
         and self.ui.applyButton.checked
         and self.ui.applyButton.enabled):
+        self.autoApplyTimer.start()
+
+  def onAutoApplyTimeout(self):
+    if not self._applying and not self.updatingGUIFromParameterNode:
         self.onApplyButton()
 
   def getPreprocessedPolyData(self):
@@ -745,6 +758,8 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     """
     if self._applying:
         return
+    if self.autoApplyTimer.isActive():
+        self.autoApplyTimer.stop()
     self._applying = True
     qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
     try:
