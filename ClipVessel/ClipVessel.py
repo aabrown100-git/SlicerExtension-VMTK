@@ -58,6 +58,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self._manualPlaneNormals = {}
     self._manualPlaneOrigins = {}
     self._normalHandleDistance = 1.0
+    self._planeEditing = False
     self._preprocessedCacheKey = None
     self._preprocessedPolyData = None
     self._applying = False
@@ -99,6 +100,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.addFlowExtensionsCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
     self.ui.parameterNodeSelector.connect('currentNodeChanged(vtkMRMLNode*)', self.setParameterNode)
     self.ui.applyButton.connect('clicked(bool)', self.onApplyButton)
+    self.ui.applyButton.connect('checkBoxToggled(bool)', self.updateParameterNodeFromGUI)
     self.ui.preprocessInputSurfaceModelCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
     self.ui.subdivideInputSurfaceModelCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
     self.ui.targetKPointCountWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
@@ -108,11 +110,13 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.extensionModeComboBox.addItems(["centerlinedirection", "boundarynormal", "linear", "thinplatespline"])
     self.ui.extensionModeComboBox.connect('currentIndexChanged(int)', self.updateParameterNodeFromGUI)
     self.ui.extensionModeComboBox.setCurrentIndex(1)
-    self.ui.autoApplyPlaneCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
     self.ui.clipPointInsetFactorWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
     self.ui.detectClipPointsButton.connect('clicked(bool)', self.onDetectClipPointsButton)
     self.ui.snapClipPointsToCenterlineCheckBox.connect("toggled(bool)", self.onSnapClipPointsToCenterlineToggled)
     self.ui.toggleOutputVisibilityButton.connect("toggled(bool)", self.onToggleOutputVisibilityButton)
+    self.ui.finishPlaneEditingButton.connect("clicked(bool)", self.finishPlaneEditing)
+    self.ui.toggleOutputVisibilityButton.setIcon(qt.QIcon(':/Icons/Medium/SlicerVisibleInvisible.png'))
+    self.ui.toggleOutputVisibilityButton.setAutoRaise(True)
 
     for nodeSelector, roleName in self.nodeSelectors:
       nodeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
@@ -212,7 +216,10 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.addFlowExtensionsCheckBox.checked = (self._parameterNode.GetParameter("ExtendOutputSurface") == "true")    
     self.ui.extensionLengthWidget.value = float(self._parameterNode.GetParameter("ExtensionLength"))
     self.ui.extensionModeComboBox.currentText = self._parameterNode.GetParameter("ExtensionMode")
-    self.ui.autoApplyPlaneCheckBox.checked = (self._parameterNode.GetParameter("AutoApplyPlane") == "true")
+    autoApply = self._parameterNode.GetParameter("AutoApplyPlane") == "true"
+    self.ui.applyButton.checkable = autoApply
+    if autoApply:
+        self.ui.applyButton.checked = True
     self.ui.clipPointInsetFactorWidget.value = float(self._parameterNode.GetParameter("ClipPointInsetFactor"))
     self.ui.detectClipPointsButton.enabled = self._parameterNode.GetNodeReference("InputCenterlines") is not None
     self.ui.snapClipPointsToCenterlineCheckBox.checked = (self._parameterNode.GetParameter("SnapClipPointsToCenterline") == "true")
@@ -239,6 +246,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.applyButton.enabled = False
 
     self.updatingGUIFromParameterNode = False
+    self.scheduleAutoApply()
 
   def updateParameterNodeFromGUI(self, caller=None, event=None):
     """
@@ -268,10 +276,11 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self._parameterNode.SetParameter("ExtendOutputSurface", "true" if self.ui.addFlowExtensionsCheckBox.checked else "false")
     self._parameterNode.SetParameter("ExtensionLength", str(self.ui.extensionLengthWidget.value))
     self._parameterNode.SetParameter("ExtensionMode", self.ui.extensionModeComboBox.currentText)
-    self._parameterNode.SetParameter("AutoApplyPlane", "true" if self.ui.autoApplyPlaneCheckBox.checked else "false")
+    self._parameterNode.SetParameter("AutoApplyPlane", "true" if self.ui.applyButton.checked else "false")
     self._parameterNode.SetParameter("ClipPointInsetFactor", str(self.ui.clipPointInsetFactorWidget.value))
     self._parameterNode.SetParameter("SnapClipPointsToCenterline", "true" if self.ui.snapClipPointsToCenterlineCheckBox.checked else "false")
     self._parameterNode.EndModify(wasModify)
+    self.scheduleAutoApply()
 
   def observeClipPointsNode(self, clipPointsNode):
     """Observe point interaction, not display hover, to select the endpoint plane."""
@@ -284,6 +293,11 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self._observedClipPointsNode = clipPointsNode
     if clipPointsNode:
         clipPointsNode.CreateDefaultDisplayNodes()
+        displayNode = clipPointsNode.GetDisplayNode()
+        if displayNode:
+            displayNode.SetPointLabelsVisibility(True)
+            if hasattr(displayNode, "SetOccludedVisibility"):
+                displayNode.SetOccludedVisibility(True)
         self.addObserver(clipPointsNode, slicer.vtkMRMLMarkupsNode.PointStartInteractionEvent, self.onClipPointInteractionStarted)
         self.addObserver(clipPointsNode, slicer.vtkMRMLMarkupsNode.PointModifiedEvent, self.onClipPointModified)
         self.addObserver(clipPointsNode, slicer.vtkMRMLMarkupsNode.PointEndInteractionEvent, self.onClipPointInteractionEnded)
@@ -344,7 +358,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     visible = displayNode.GetVisibility() if displayNode else True
     wasBlocked = self.ui.toggleOutputVisibilityButton.blockSignals(True)
     self.ui.toggleOutputVisibilityButton.checked = visible
-    self.ui.toggleOutputVisibilityButton.text = "Hide output" if visible else "Show output"
+    self.ui.toggleOutputVisibilityButton.toolTip = "Hide output surface" if visible else "Show output surface"
     self.ui.toggleOutputVisibilityButton.blockSignals(wasBlocked)
 
   def onToggleOutputVisibilityButton(self, checked=None):
@@ -352,7 +366,21 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     displayNode = outputModelNode.GetDisplayNode() if outputModelNode else None
     if displayNode:
         displayNode.SetVisibility(checked)
-    self.ui.toggleOutputVisibilityButton.text = "Hide output" if checked else "Show output"
+    self.ui.toggleOutputVisibilityButton.toolTip = "Hide output surface" if checked else "Show output surface"
+
+  def finishPlaneEditing(self):
+    """Hide temporary plane markups and leave interactive plane editing mode."""
+    planeNode = self._parameterNode.GetNodeReference("ManualClipPlane") if self._parameterNode else None
+    normalHandleNode = self._parameterNode.GetNodeReference("ManualClipPlaneNormalHandle") if self._parameterNode else None
+    if planeNode:
+        planeNode.SetDisplayVisibility(False)
+    if normalHandleNode:
+        normalHandleNode.SetDisplayVisibility(False)
+    self._activeClipPointIndex = -1
+    self._planeEditing = False
+    self.ui.finishPlaneEditingButton.enabled = False
+    self.ui.clipStatusLabel.text = "Plane editing finished. Click a centerline endpoint to edit another plane."
+    self.ui.clipStatusLabel.styleSheet = ""
 
   def observeInteractivePlaneNode(self, planeNode):
     if planeNode == self._observedInteractivePlaneNode:
@@ -464,6 +492,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self._normalHandleDistance = max(radius * 2.0, 1.0)
 
     self._activeClipPointIndex = pointIndex
+    self._planeEditing = True
     self._updatingInteractivePlane = True  # suppress re-entrant modified events during setup
     wasModify = planeNode.StartModify()
     planeNode.RemoveAllControlPoints()
@@ -475,8 +504,8 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     planeNode.SetSize(radius * 4.0, radius * 4.0)
     planeNode.EndModify(wasModify)
     planeNode.SetDisplayVisibility(True)
-    # The normal is adjusted by dragging the separate orange handle point, so the plane's own
-    # rotate/translate/scale handles aren't needed (resizing the plane no longer affects the cut).
+    # The normal is adjusted by the separate orange handle point. Native plane handles are
+    # intentionally disabled because the rendered rectangle is only a visual aid.
     displayNode = planeNode.GetDisplayNode()
     if displayNode:
         displayNode.SetHandlesInteractive(False)
@@ -494,9 +523,10 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self._updatingInteractivePlane = False
 
     slicer.modules.markups.logic().SetActiveListID(planeNode)
+    self.ui.finishPlaneEditingButton.enabled = True
     self.ui.clipStatusLabel.text = "Adjusting %s: drag the center point to move it, or drag the orange handle to set the normal.%s" % (
         clipPointsNode.GetNthControlPointLabel(pointIndex),
-        " Changes apply when released." if self.ui.autoApplyPlaneCheckBox.checked else " Click Apply when ready.")
+        " Changes apply when released." if self.ui.applyButton.checked else " Click Apply when ready.")
     self.ui.clipStatusLabel.styleSheet = ""
 
   def onInteractivePlaneModified(self, caller=None, event=None):
@@ -632,6 +662,8 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     # Stop showing/adjusting whatever plane was up before the points underneath it are replaced.
     self._activeClipPointIndex = -1
+    self._planeEditing = False
+    self.ui.finishPlaneEditingButton.enabled = False
     planeNode = self._parameterNode.GetNodeReference("ManualClipPlane")
     if planeNode:
         planeNode.SetDisplayVisibility(False)
@@ -658,7 +690,9 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.clipStatusLabel.styleSheet = "QLabel { color: #008000; }"
 
   def scheduleAutoApply(self):
-    if self.ui.autoApplyPlaneCheckBox.checked and self.ui.applyButton.enabled:
+    if (not self._applying and not self.updatingGUIFromParameterNode
+        and self.ui.applyButton.checked
+        and self.ui.applyButton.enabled):
         self.onApplyButton()
 
   def getPreprocessedPolyData(self):
