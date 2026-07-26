@@ -75,7 +75,7 @@
            <bool>false</bool>
           </property>
           <property name="baseName">
-           <string>Clippoints</string>
+           <string>Clip points</string>
           </property>
           <property name="noneEnabled">
            <bool>true</bool>

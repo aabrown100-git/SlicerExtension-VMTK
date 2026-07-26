@@ -114,11 +114,6 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.snapClipPointsToCenterlineCheckBox.connect("toggled(bool)", self.onSnapClipPointsToCenterlineToggled)
     self.ui.toggleOutputVisibilityButton.connect("toggled(bool)", self.onToggleOutputVisibilityButton)
 
-    self.autoApplyTimer = qt.QTimer()
-    self.autoApplyTimer.setSingleShot(True)
-    self.autoApplyTimer.setInterval(60)
-    self.autoApplyTimer.connect("timeout()", self.onAutoApplyTimeout)
-
     for nodeSelector, roleName in self.nodeSelectors:
       nodeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
       
@@ -627,7 +622,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     clipPointsNode = self._parameterNode.GetNodeReference("ClipPoints")
     if not clipPointsNode:
-        clipPointsNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "Clippoints")
+        clipPointsNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "Clip points")
         self._parameterNode.SetNodeReferenceID("ClipPoints", clipPointsNode.GetID())
     elif clipPointsNode.GetNumberOfControlPoints() > 0:
         if not slicer.util.confirmYesNoDisplay(
@@ -637,6 +632,12 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     # Stop showing/adjusting whatever plane was up before the points underneath it are replaced.
     self._activeClipPointIndex = -1
+    planeNode = self._parameterNode.GetNodeReference("ManualClipPlane")
+    if planeNode:
+        planeNode.SetDisplayVisibility(False)
+    normalHandleNode = self._parameterNode.GetNodeReference("ManualClipPlaneNormalHandle")
+    if normalHandleNode:
+        normalHandleNode.SetDisplayVisibility(False)
 
     wasModify = clipPointsNode.StartModify()
     clipPointsNode.RemoveAllControlPoints()
@@ -658,10 +659,6 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
   def scheduleAutoApply(self):
     if self.ui.autoApplyPlaneCheckBox.checked and self.ui.applyButton.enabled:
-        self.autoApplyTimer.start()
-
-  def onAutoApplyTimeout(self):
-    if not self._applying:
         self.onApplyButton()
 
   def getPreprocessedPolyData(self):
