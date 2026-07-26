@@ -100,6 +100,12 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.autoApplyTimer.setInterval(60)
     self.autoApplyTimer.connect("timeout()", self.onAutoApplyTimeout)
 
+    self.inputVisibilityButtons = [
+        (self.ui.toggleInputSurfaceVisibilityButton, "InputSurface", "input surface"),
+        (self.ui.toggleCenterlinesVisibilityButton, "InputCenterlines", "centerlines"),
+        (self.ui.toggleClipPointsVisibilityButton, "ClipPoints", "clip points"),
+    ]
+
     self.setParameterNode(self.logic.getParameterNode())
 
     # Connections
@@ -121,9 +127,17 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.detectClipPointsButton.connect('clicked(bool)', self.onDetectClipPointsButton)
     self.ui.snapClipPointsToCenterlineCheckBox.connect("toggled(bool)", self.onSnapClipPointsToCenterlineToggled)
     self.ui.toggleOutputVisibilityButton.connect("toggled(bool)", self.onToggleOutputVisibilityButton)
+    self.ui.toggleOutputEdgesButton.connect("toggled(bool)", self.onToggleOutputEdgesButton)
     self.ui.finishPlaneEditingButton.connect("clicked(bool)", self.finishPlaneEditing)
     self.ui.toggleOutputVisibilityButton.setIcon(qt.QIcon(':/Icons/Medium/SlicerVisibleInvisible.png'))
     self.ui.toggleOutputVisibilityButton.setAutoRaise(True)
+    self.ui.toggleOutputEdgesButton.setAutoRaise(True)
+    for button, roleName, objectName in self.inputVisibilityButtons:
+        button.setIcon(qt.QIcon(':/Icons/Medium/SlicerVisibleInvisible.png'))
+        button.setAutoRaise(True)
+        button.connect("toggled(bool)",
+                       lambda checked, roleName=roleName, button=button, objectName=objectName:
+                       self.onToggleNodeVisibility(roleName, checked, button, objectName))
 
     for nodeSelector, roleName in self.nodeSelectors:
       nodeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
@@ -203,6 +217,10 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         nodeSelector.setCurrentNode(self._parameterNode.GetNodeReference(roleName))
 
     inputSurfaceNode = self._parameterNode.GetNodeReference("InputSurface")
+    inputSurfaceName = inputSurfaceNode.GetName() if inputSurfaceNode else None
+    self.ui.outputSurfaceModelSelector.baseName = (
+        inputSurfaceName + " clipped" if inputSurfaceName else "Output surface model")
+    self.ensureOutputSurfaceNode(inputSurfaceNode)
     if inputSurfaceNode and inputSurfaceNode.IsA("vtkMRMLSegmentationNode"):
         self.ui.inputSegmentSelectorWidget.setCurrentSegmentID(self._parameterNode.GetParameter("InputSegmentID"))
         self.ui.inputSegmentSelectorWidget.setVisible(True)
@@ -235,6 +253,8 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.observeClipPointsNode(self._parameterNode.GetNodeReference("ClipPoints"))
     self.updateClipPointsSnapMode()
     self.updateOutputVisibilityButton()
+    self.updateOutputEdgesButton()
+    self.updateInputVisibilityButtons()
 
     if self.logic.lastPlanarityFailures:
         failedLabels = [result["label"] for result in self.logic.lastPlanarityFailures]
@@ -256,6 +276,16 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     self.updatingGUIFromParameterNode = False
     self.scheduleAutoApply()
+
+  def ensureOutputSurfaceNode(self, inputSurfaceNode):
+    """Create and select a default output model when an input surface is available."""
+    if not inputSurfaceNode or self._parameterNode.GetNodeReference("OutputSurfaceModel"):
+        return
+    outputName = inputSurfaceNode.GetName() + " clipped"
+    outputModelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", outputName)
+    outputModelNode.CreateDefaultDisplayNodes()
+    self._parameterNode.SetNodeReferenceID("OutputSurfaceModel", outputModelNode.GetID())
+    self.ui.outputSurfaceModelSelector.setCurrentNode(outputModelNode)
 
   def updateParameterNodeFromGUI(self, caller=None, event=None):
     """
@@ -376,6 +406,40 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     if displayNode:
         displayNode.SetVisibility(checked)
     self.ui.toggleOutputVisibilityButton.toolTip = "Hide output surface" if checked else "Show output surface"
+
+  def updateOutputEdgesButton(self):
+    """Sync the Outputs edge toggle with the output model display node."""
+    outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel") if self._parameterNode else None
+    displayNode = outputModelNode.GetDisplayNode() if outputModelNode else None
+    self.ui.toggleOutputEdgesButton.enabled = displayNode is not None
+    edgeVisible = displayNode.GetEdgeVisibility() if displayNode else False
+    wasBlocked = self.ui.toggleOutputEdgesButton.blockSignals(True)
+    self.ui.toggleOutputEdgesButton.checked = edgeVisible
+    self.ui.toggleOutputEdgesButton.blockSignals(wasBlocked)
+
+  def onToggleOutputEdgesButton(self, checked=None):
+    outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel") if self._parameterNode else None
+    displayNode = outputModelNode.GetDisplayNode() if outputModelNode else None
+    if displayNode:
+        displayNode.SetEdgeVisibility(checked)
+
+  def updateInputVisibilityButtons(self):
+    for button, roleName, objectName in self.inputVisibilityButtons:
+        node = self._parameterNode.GetNodeReference(roleName) if self._parameterNode else None
+        displayNode = node.GetDisplayNode() if node else None
+        button.enabled = displayNode is not None
+        visible = displayNode.GetVisibility() if displayNode else True
+        wasBlocked = button.blockSignals(True)
+        button.checked = visible
+        button.toolTip = "Hide %s" % objectName if visible else "Show %s" % objectName
+        button.blockSignals(wasBlocked)
+
+  def onToggleNodeVisibility(self, roleName, checked, button, objectName):
+    node = self._parameterNode.GetNodeReference(roleName) if self._parameterNode else None
+    displayNode = node.GetDisplayNode() if node else None
+    if displayNode:
+        displayNode.SetVisibility(checked)
+    button.toolTip = "Hide %s" % objectName if checked else "Show %s" % objectName
 
   def finishPlaneEditing(self):
     """Hide temporary plane markups and leave interactive plane editing mode."""
@@ -802,7 +866,8 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             outputModelNode.CreateDefaultDisplayNodes()
             outputModelNode.GetDisplayNode().SetColor(0.75, 0.75, 0.75)
             outputModelNode.GetDisplayNode().SetLineWidth(3)
-            self.updateOutputVisibilityButton()
+        self.updateOutputVisibilityButton()
+        self.updateOutputEdgesButton()
 
         if self.logic.lastUnclippedPoints:
             self.ui.clipStatusLabel.text = ("No cut made at: " + ", ".join(self.logic.lastUnclippedPoints) +

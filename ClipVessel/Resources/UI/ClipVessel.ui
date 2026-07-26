@@ -25,32 +25,58 @@
        </widget>
       </item>
       <item row="0" column="1">
-       <widget class="qMRMLNodeComboBox" name="inputSurfaceSelector">
-        <property name="toolTip">
-         <string>Input surface model of the tree. If computation is slow adjust preprocessing parameters in advanced section.</string>
-        </property>
-        <property name="nodeTypes">
-         <stringlist>
-          <string>vtkMRMLModelNode</string>
-          <string>vtkMRMLSegmentationNode</string>
-         </stringlist>
-        </property>
-        <property name="showChildNodeTypes">
-         <bool>false</bool>
-        </property>
-        <property name="addEnabled">
-         <bool>false</bool>
-        </property>
-        <property name="removeEnabled">
-         <bool>false</bool>
-        </property>
-        <property name="editEnabled">
-         <bool>true</bool>
-        </property>
-        <property name="noneDisplay">
-         <string>Select a model or segmentation node</string>
-        </property>
-       </widget>
+       <layout class="QHBoxLayout" name="inputSurfaceRowLayout">
+        <item>
+         <widget class="qMRMLNodeComboBox" name="inputSurfaceSelector">
+          <property name="toolTip">
+           <string>Input surface model of the tree. If computation is slow adjust preprocessing parameters in advanced section.</string>
+          </property>
+          <property name="nodeTypes">
+           <stringlist>
+            <string>vtkMRMLModelNode</string>
+            <string>vtkMRMLSegmentationNode</string>
+           </stringlist>
+          </property>
+          <property name="showChildNodeTypes">
+           <bool>false</bool>
+          </property>
+          <property name="addEnabled">
+           <bool>false</bool>
+          </property>
+          <property name="removeEnabled">
+           <bool>false</bool>
+          </property>
+          <property name="editEnabled">
+           <bool>true</bool>
+          </property>
+          <property name="noneDisplay">
+           <string>Select a model or segmentation node</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QToolButton" name="toggleInputSurfaceVisibilityButton">
+          <property name="enabled">
+           <bool>false</bool>
+          </property>
+          <property name="toolTip">
+           <string>Show or hide the input surface</string>
+          </property>
+          <property name="toolButtonStyle">
+           <enum>Qt::ToolButtonIconOnly</enum>
+          </property>
+          <property name="autoRaise">
+           <bool>true</bool>
+          </property>
+          <property name="checkable">
+           <bool>true</bool>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+       </layout>
       </item>
       <item row="3" column="0">
        <widget class="QLabel" name="label_9">
@@ -95,6 +121,28 @@
          </widget>
         </item>
         <item>
+         <widget class="QToolButton" name="toggleClipPointsVisibilityButton">
+          <property name="enabled">
+           <bool>false</bool>
+          </property>
+          <property name="toolTip">
+           <string>Show or hide the clip points</string>
+          </property>
+          <property name="toolButtonStyle">
+           <enum>Qt::ToolButtonIconOnly</enum>
+          </property>
+          <property name="autoRaise">
+           <bool>true</bool>
+          </property>
+          <property name="checkable">
+           <bool>true</bool>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item>
          <widget class="qSlicerMarkupsPlaceWidget" name="clipPointsMarkupsPlaceWidget"/>
         </item>
         <item>
@@ -117,31 +165,57 @@
        </widget>
       </item>
       <item row="2" column="1">
-       <widget class="qMRMLNodeComboBox" name="inputCenterlinesSelector">
-        <property name="toolTip">
-         <string>Input centerlines of the tree.</string>
-        </property>
-        <property name="nodeTypes">
-         <stringlist>
-          <string>vtkMRMLModelNode</string>
-         </stringlist>
-        </property>
-        <property name="showChildNodeTypes">
-         <bool>false</bool>
-        </property>
-        <property name="addEnabled">
-         <bool>false</bool>
-        </property>
-        <property name="removeEnabled">
-         <bool>false</bool>
-        </property>
-        <property name="editEnabled">
-         <bool>true</bool>
-        </property>
-        <property name="noneDisplay">
-         <string>Select a model node</string>
-        </property>
-       </widget>
+       <layout class="QHBoxLayout" name="inputCenterlinesRowLayout">
+        <item>
+         <widget class="qMRMLNodeComboBox" name="inputCenterlinesSelector">
+          <property name="toolTip">
+           <string>Input centerlines of the tree.</string>
+          </property>
+          <property name="nodeTypes">
+           <stringlist>
+            <string>vtkMRMLModelNode</string>
+           </stringlist>
+          </property>
+          <property name="showChildNodeTypes">
+           <bool>false</bool>
+          </property>
+          <property name="addEnabled">
+           <bool>false</bool>
+          </property>
+          <property name="removeEnabled">
+           <bool>false</bool>
+          </property>
+          <property name="editEnabled">
+           <bool>true</bool>
+          </property>
+          <property name="noneDisplay">
+           <string>Select a model node</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QToolButton" name="toggleCenterlinesVisibilityButton">
+          <property name="enabled">
+           <bool>false</bool>
+          </property>
+          <property name="toolTip">
+           <string>Show or hide the centerlines</string>
+          </property>
+          <property name="toolButtonStyle">
+           <enum>Qt::ToolButtonIconOnly</enum>
+          </property>
+          <property name="autoRaise">
+           <bool>true</bool>
+          </property>
+          <property name="checkable">
+           <bool>true</bool>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+       </layout>
       </item>
       <item row="1" column="1">
        <widget class="qMRMLSegmentSelectorWidget" name="inputSegmentSelectorWidget">
@@ -211,8 +285,14 @@
        <layout class="QHBoxLayout" name="outputSurfaceRowLayout">
         <item>
          <widget class="qMRMLNodeComboBox" name="outputSurfaceModelSelector">
-          <property name="toolTip">
-           <string>Result of clipping input model</string>
+         <property name="toolTip">
+          <string>Result of clipping input model</string>
+         </property>
+          <property name="maximumSize">
+           <size>
+            <width>360</width>
+            <height>16777215</height>
+           </size>
           </property>
           <property name="nodeTypes">
            <stringlist>
@@ -264,6 +344,28 @@
           </property>
           <property name="checked">
            <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QToolButton" name="toggleOutputEdgesButton">
+          <property name="enabled">
+           <bool>false</bool>
+          </property>
+          <property name="toolTip">
+           <string>Show or hide the output surface edges</string>
+          </property>
+          <property name="text">
+           <string>Edges</string>
+          </property>
+          <property name="autoRaise">
+           <bool>true</bool>
+          </property>
+          <property name="checkable">
+           <bool>true</bool>
+          </property>
+          <property name="checked">
+           <bool>false</bool>
           </property>
          </widget>
         </item>
