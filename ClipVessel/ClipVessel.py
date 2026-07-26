@@ -1,6 +1,4 @@
-import os
 import json
-import unittest
 import logging
 import vtk, qt, ctk, slicer
 import numpy as np
@@ -907,19 +905,10 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     ScriptedLoadableModuleLogic.__init__(self)
     self.radiusArrayName = 'Radius'
     self.blankingArrayName = 'Blanking'
-    self.groupIdsArrayName = 'GroupIds'
-    self.tractIdsArrayName = 'TractIds'
-    self.centerlineIdsArrayName = 'CenterlineIds'
     
     self.gapLength = 1.0
     self.tolerance = 0.01
     self.clipValue = 0.0
-    self.cutoffRadiusFactor = 1E16
-
-    self.groupIds = []
-
-    self.useRadiusInformation = 1
-
     self.Sigma = 1
     self.AdaptiveExtensionLength = 0
     self.AdaptiveExtensionRadius = 1
@@ -1380,27 +1369,6 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
             self.lastPlanarityFailures.append(result)
     
     
-  def set_clipper(self, surface, splitCenterlines, groupIds):
-    # if we work under the assumption that group 0 is always kept it will eliminate the use of user interaction to select which groups to keep.
-    branchClipper = vtkvmtkComputationalGeometry.vtkvmtkPolyDataCenterlineGroupsClipper()
-    branchClipper.SetCenterlineGroupIdsArrayName(self.groupIdsArrayName)
-    branchClipper.SetGroupIdsArrayName(self.groupIdsArrayName)
-    branchClipper.SetCenterlineRadiusArrayName(self.radiusArrayName)
-    branchClipper.SetBlankingArrayName(self.blankingArrayName)
-    branchClipper.SetCutoffRadiusFactor(self.cutoffRadiusFactor)
-    branchClipper.SetClipValue(self.clipValue)
-    branchClipper.SetUseRadiusInformation(self.useRadiusInformation)
-    if groupIds.GetNumberOfIds() > 0:
-      branchClipper.ClipAllCenterlineGroupIdsOff()
-      branchClipper.SetCenterlineGroupIds(groupIds)
-      branchClipper.GenerateClippedOutputOn()
-    else:
-      branchClipper.ClipAllCenterlineGroupIdsOn()
-    branchClipper.SetInputData(surface)
-    branchClipper.SetCenterlines(splitCenterlines)
-    branchClipper.Update()
-    return branchClipper
-
   def resampleCenterline(self, polydata, spacing=0.5):
     """Resamples centerline with a spline filter to a desired spacing"""
     splineFilter = vtk.vtkSplineFilter()
@@ -1477,7 +1445,6 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
             clipPoints.append(centerlinesPolyData.GetPoint(pointId))
 
     planeSpecifications = []
-    self.lastClipPointCounts = []
     self.lastUnclippedPoints = []
 
     for controlPointIndex in range(numberOfControlPoints):
@@ -1499,7 +1466,6 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
 
     def applyPlane(currentSurface, specification):
         clippedSurface, clipped, reason = self.clipModel(currentSurface, specification["origin"], specification["normal"])
-        self.lastClipPointCounts.append((specification["index"], clippedSurface.GetNumberOfPoints()))
         if clippedSurface.GetNumberOfPoints() == 0:
             logging.error("Plane removed the entire surface; skipping clip point %d.", specification["index"])
             return currentSurface
