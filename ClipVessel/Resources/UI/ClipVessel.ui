@@ -677,6 +677,43 @@
         </property>
        </widget>
       </item>
+      <item row="10" column="0">
+       <widget class="QLabel" name="clippingMethodLabel">
+        <property name="text">
+         <string>Clipping method:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="10" column="1">
+       <widget class="QComboBox" name="clippingMethodComboBox">
+        <property name="toolTip">
+         <string>Plane clipping is recommended for interactive work. Plane plus local sphere limits the implicit cut region and may reduce seams at the cost of longer processing time.</string>
+        </property>
+        <property name="editable">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="11" column="0">
+       <widget class="QLabel" name="freeNormalHandleLabel">
+        <property name="text">
+         <string>Free plane normal handle:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="11" column="1">
+       <widget class="QCheckBox" name="freeNormalHandleCheckBox">
+        <property name="toolTip">
+         <string>Use the free plane normal handle instead of Slicer's standard orthogonal translation and rotation handles.</string>
+        </property>
+        <property name="text">
+         <string/>
+        </property>
+        <property name="checked">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
      </layout>
     </widget>
    </item>
