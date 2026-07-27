@@ -140,6 +140,8 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     for nodeSelector, roleName in self.nodeSelectors:
       nodeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
       
+    self.addObserver(slicer.mrmlScene, slicer.vtkMRMLScene.EndBatchProcessEvent,
+                     self.onSceneBatchProcessEnded)
     self.updateGUIFromParameterNode()
     
 
@@ -273,7 +275,13 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.applyButton.enabled = False
 
     self.updatingGUIFromParameterNode = False
-    self.scheduleAutoApply()
+    if not slicer.mrmlScene.IsBatchProcessing():
+        self.scheduleAutoApply()
+
+  def onSceneBatchProcessEnded(self, caller=None, event=None):
+    """Refresh restored parameters and apply them after scene loading finishes."""
+    if self._parameterNode and slicer.mrmlScene.IsNodePresent(self._parameterNode):
+        self.updateGUIFromParameterNode()
 
   def ensureOutputSurfaceNode(self, inputSurfaceNode):
     """Create and select a default output model when an input surface is available."""
@@ -847,8 +855,10 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         extensionLength = float(self._parameterNode.GetParameter("ExtensionLength"))
         self.saveManualPlaneNormals()
 
-        cap = self.ui.capOutputSurfaceModelCheckBox.checked
-        addFlowExtensions = self.ui.addFlowExtensionsCheckBox.checked
+        # Read processing options from the parameter node. The GUI may still be
+        # synchronizing after a saved scene is restored.
+        cap = self._parameterNode.GetParameter("CapOutputSurface") == "true"
+        addFlowExtensions = self._parameterNode.GetParameter("ExtendOutputSurface") == "true"
         extensionMode = self._parameterNode.GetParameter("ExtensionMode")
 
         slicer.util.showStatusMessage("Clipping model...")
