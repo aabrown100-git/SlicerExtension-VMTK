@@ -246,8 +246,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.extensionModeComboBox.currentText = self._parameterNode.GetParameter("ExtensionMode")
     autoApply = self._parameterNode.GetParameter("AutoApplyPlane") == "true"
     self.ui.applyButton.checkable = autoApply
-    if autoApply:
-        self.ui.applyButton.checked = True
+    self.ui.applyButton.checked = autoApply
     self.ui.clipPointInsetFactorWidget.value = float(self._parameterNode.GetParameter("ClipPointInsetFactor"))
     self.ui.detectClipPointsButton.enabled = self._parameterNode.GetNodeReference("InputCenterlines") is not None
     self.ui.snapClipPointsToCenterlineCheckBox.checked = (self._parameterNode.GetParameter("SnapClipPointsToCenterline") == "true")
@@ -989,7 +988,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     if not parameterNode.GetParameter("ManualClipPlaneOrigins"):
         parameterNode.SetParameter("ManualClipPlaneOrigins", "{}")
     if not parameterNode.GetParameter("AutoApplyPlane"):
-        parameterNode.SetParameter("AutoApplyPlane", "true")
+        parameterNode.SetParameter("AutoApplyPlane", "false")
     if not parameterNode.GetParameter("ClipPointInsetFactor"):
         parameterNode.SetParameter("ClipPointInsetFactor", "0.5")
     if not parameterNode.GetParameter("SnapClipPointsToCenterline"):
