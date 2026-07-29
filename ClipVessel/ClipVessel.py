@@ -119,7 +119,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.extensionModeComboBox.connect('currentIndexChanged(int)', self.updateParameterNodeFromGUI)
     self.ui.extensionModeComboBox.setCurrentIndex(1)
     self.ui.clipPointInsetFactorWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
-    self.ui.clippingMethodComboBox.addItems(["Plane", "Plane + local sphere"])
+    self.ui.clippingMethodComboBox.addItems(["Plane", "Plane + local sphere", "Plane + local patch", "Plane + local box"])
     self.ui.clippingMethodComboBox.connect('currentIndexChanged(int)', self.onClippingMethodChanged)
     self.ui.localSphereRadiusFactorWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
     self.ui.freeNormalHandleCheckBox.connect("toggled(bool)", self.onFreeNormalHandleToggled)
@@ -370,9 +370,15 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.updateClippingMethodUI(self.ui.clippingMethodComboBox.currentText)
 
   def updateClippingMethodUI(self, clippingMethod):
-    localSphere = clippingMethod == "Plane + local sphere"
-    self.ui.localSphereRadiusFactorLabel.setVisible(localSphere)
-    self.ui.localSphereRadiusFactorWidget.setVisible(localSphere)
+    localMethod = clippingMethod in ("Plane + local sphere", "Plane + local patch", "Plane + local box")
+    self.ui.localSphereRadiusFactorLabel.setVisible(localMethod)
+    self.ui.localSphereRadiusFactorWidget.setVisible(localMethod)
+    if clippingMethod == "Plane + local box":
+        self.ui.localSphereRadiusFactorLabel.text = "Local box size:"
+    elif clippingMethod == "Plane + local patch":
+        self.ui.localSphereRadiusFactorLabel.text = "Local patch radius:"
+    else:
+        self.ui.localSphereRadiusFactorLabel.text = "Local sphere radius:"
 
   def updatePlaneHandleMode(self):
     planeNode = self._parameterNode.GetNodeReference("ManualClipPlane") if self._parameterNode else None
@@ -1107,31 +1113,114 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     in which case reason is "no_surface": nothing exists on the discard side to remove (e.g.
     the clip point sits exactly at, or beyond, the vessel end). reason is None when clipped
     is True. Whether a cut that DID happen looks right is left to the user to judge (e.g. via
-    the output status/visualization) rather than rejected automatically here."""
+    the output status/visualization) rather than rejected automatically here.
+    clippingMethod selects how the cut is confined: "Plane" clips with the infinite plane and
+    relies on connectivity alone. "Plane + local sphere" clips with the intersection of the
+    plane and a sphere of radius sphereRadiusFactor*localRadius around planeOrigin; this
+    confines the cut, but also cuts and re-stitches the mesh along the sphere surface, which
+    can leave a visible seam ring on the vessel wall. "Plane + local patch" achieves the same
+    confinement without a seam: the plain-plane cut is restricted to whole cells within the
+    same sphere, so no new points are created at the sphere boundary and the cut stays exactly
+    planar. "Plane + local box" clips with an open-ended oriented box whose base face lies
+    exactly in the cut plane (lateral half-width sphereRadiusFactor*localRadius), which keeps
+    the cut planar while confining it laterally - but the box side faces will cut (and leave
+    seams on) anything they happen to pass through."""
     clipFunctionPlane = vtk.vtkPlane()
     clipFunctionPlane.SetOrigin(planeOrigin)
     clipFunctionPlane.SetNormal(planeNormal)
-    clipFunction = clipFunctionPlane
-    if clippingMethod == "Plane + local sphere" and localRadius and localRadius > 0:
-        # Limit the implicit cut to a neighborhood around the selected vessel end.
-        # This is intentionally opt-in because the additional implicit-function
-        # evaluation is slower than the default infinite-plane path.
+
+    # "Plane + local patch" limits the cut to a neighborhood around the selected vessel end.
+    # The mesh is partitioned into whole cells near the clip point (the local patch) and the
+    # untouched remainder, and only the patch is clipped with the plain plane. Unlike the
+    # "Plane + local sphere" implicit intersection below, this never cuts the mesh open along
+    # the sphere itself (where vtkSphere's quadratic function also misplaces the linearly
+    # interpolated cut points), so no seam ring appears on the vessel wall. The whole-cell
+    # partition creates no new points at the sphere boundary, so patch and remainder share
+    # their original border vertices and merge back seamlessly, and the cut surface stays
+    # exactly planar.
+    remainderSurface = None
+    clipInputSurface = surface
+    if clippingMethod == "Plane + local patch" and localRadius and localRadius > 0:
         localSphere = vtk.vtkSphere()
         localSphere.SetCenter(planeOrigin)
         localSphere.SetRadius(max(localRadius * sphereRadiusFactor, 1.0))
-        localImplicitFunction = vtk.vtkImplicitBoolean()
-        localImplicitFunction.SetOperationTypeToIntersection()
-        localImplicitFunction.AddFunction(clipFunctionPlane)
-        localImplicitFunction.AddFunction(localSphere)
-        clipFunction = localImplicitFunction
+        # Local patch: every cell with at least one point inside the sphere.
+        patchExtractor = vtk.vtkExtractPolyDataGeometry()
+        patchExtractor.SetInputData(surface)
+        patchExtractor.SetImplicitFunction(localSphere)
+        patchExtractor.ExtractInsideOn()
+        patchExtractor.ExtractBoundaryCellsOn()
+        patchExtractor.Update()
+        # Remainder: the complement, cells with all points outside the sphere.
+        remainderExtractor = vtk.vtkExtractPolyDataGeometry()
+        remainderExtractor.SetInputData(surface)
+        remainderExtractor.SetImplicitFunction(localSphere)
+        remainderExtractor.ExtractInsideOff()
+        remainderExtractor.ExtractBoundaryCellsOff()
+        remainderExtractor.Update()
+        if patchExtractor.GetOutput().GetNumberOfCells() == 0:
+            # No surface anywhere near the clip point: nothing to cut.
+            output = vtk.vtkPolyData()
+            output.DeepCopy(surface)
+            return output, False, "no_surface"
+        clipInputSurface = patchExtractor.GetOutput()
+        remainderSurface = remainderExtractor.GetOutput()
+
+    # "Plane + local box" confines the cut with a single oriented box whose base face lies
+    # exactly in the cut plane and which extends past the vessel end. The only place its
+    # boundary should meet the surface is that flat base face, so the cut stays planar and
+    # seam-free without cutting the mesh along a sphere - provided the side faces clear the
+    # surface (choose the size factor accordingly).
+    clipFunction = clipFunctionPlane
+    # InsideOut(1) keeps the negative-normal (vessel interior) side of the plane as the main
+    # output, and puts the positive-normal (branch end) side - the discard candidate - in the
+    # clipped output. For the box, the discard region is the box interior (negative function
+    # values), so InsideOut is off to retain the exterior instead.
+    clipInsideOut = 1
+    if clippingMethod == "Plane + local sphere" and localRadius and localRadius > 0:
+        # Limit the implicit cut to a neighborhood around the selected vessel end by
+        # intersecting the plane with a sphere. This also cuts and re-stitches the mesh
+        # along the sphere surface, which can leave a visible seam ring on the vessel wall;
+        # "Plane + local patch" (above) is the seam-free alternative.
+        localSphere = vtk.vtkSphere()
+        localSphere.SetCenter(planeOrigin)
+        localSphere.SetRadius(max(localRadius * sphereRadiusFactor, 1.0))
+        sphereImplicitFunction = vtk.vtkImplicitBoolean()
+        sphereImplicitFunction.SetOperationTypeToIntersection()
+        sphereImplicitFunction.AddFunction(clipFunctionPlane)
+        sphereImplicitFunction.AddFunction(localSphere)
+        clipFunction = sphereImplicitFunction
+    if clippingMethod == "Plane + local box" and localRadius and localRadius > 0:
+        boxAxisZ = list(planeNormal)
+        vtk.vtkMath.Normalize(boxAxisZ)
+        boxAxisX = [0.0, 0.0, 0.0]
+        boxAxisY = [0.0, 0.0, 0.0]
+        vtk.vtkMath.Perpendiculars(boxAxisZ, boxAxisX, boxAxisY, 0.0)
+        # Long enough to always reach past the branch end, wherever it is on the surface.
+        bounds = surface.GetBounds()
+        boxLength = np.linalg.norm([bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4]])
+        halfWidth = max(localRadius * sphereRadiusFactor, 1.0)
+        localToWorldMatrix = vtk.vtkMatrix4x4()
+        for row in range(3):
+            localToWorldMatrix.SetElement(row, 0, boxAxisX[row])
+            localToWorldMatrix.SetElement(row, 1, boxAxisY[row])
+            localToWorldMatrix.SetElement(row, 2, boxAxisZ[row])
+            localToWorldMatrix.SetElement(row, 3, planeOrigin[row])
+        # vtkImplicitFunction applies its transform to each query point before evaluation,
+        # so the box (defined in its local frame) needs the world-to-local transform.
+        worldToLocalTransform = vtk.vtkTransform()
+        worldToLocalTransform.SetMatrix(localToWorldMatrix)
+        worldToLocalTransform.Inverse()
+        localBox = vtk.vtkBox()
+        localBox.SetBounds(-halfWidth, halfWidth, -halfWidth, halfWidth, 0.0, boxLength)
+        localBox.SetTransform(worldToLocalTransform)
+        clipFunction = localBox
+        clipInsideOut = 0
 
     clipper = vtk.vtkClipPolyData()
-    clipper.SetInputData(surface)
+    clipper.SetInputData(clipInputSurface)
     clipper.GenerateClippedOutputOn()
-    # InsideOut(1) keeps the negative-normal (vessel interior) side as the main output, and
-    # puts the positive-normal (branch end) side - the discard candidate - in the clipped
-    # output.
-    clipper.SetInsideOut(1)
+    clipper.SetInsideOut(clipInsideOut)
     clipper.GenerateClipScalarsOff()
     clipper.SetValue(0.0)
     clipper.SetClipFunction(clipFunction)
@@ -1188,6 +1277,11 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     append = vtk.vtkAppendPolyData()
     append.AddInputData(retainedSurface)
     append.AddInputConnection(nonTargetRegions.GetOutputPort())
+    if remainderSurface is not None and remainderSurface.GetNumberOfCells() > 0:
+        # Cells outside the local sphere were never fed to the clipper; put them back. They
+        # share their original border vertices with the patch, so cleaning merges them
+        # without leaving a seam.
+        append.AddInputData(remainderSurface)
     append.Update()
     clean = vtk.vtkCleanPolyData()
     clean.SetInputConnection(append.GetOutputPort())

@@ -687,7 +687,7 @@
       <item row="10" column="1">
        <widget class="QComboBox" name="clippingMethodComboBox">
         <property name="toolTip">
-         <string>Plane is fast and produces planar cuts. Plane + local sphere reduces seams away from the clipping area, but may sometimes produce non-planar cuts.</string>
+         <string>Plane cuts with an infinite plane (other branches the plane crosses are preserved by connectivity). Plane + local sphere cuts with the intersection of the plane and a sphere around the clip point; this confines the cut but may leave a seam ring where the sphere crosses the vessel wall. Plane + local patch confines the plane cut to the surface cells near the clip point without creating any seam. Plane + local box cuts with an open box whose base face lies in the cut plane; the cut is planar, but the box sides may leave seams if they touch other parts of the surface.</string>
         </property>
         <property name="editable">
          <bool>false</bool>
@@ -704,7 +704,7 @@
       <item row="11" column="1">
        <widget class="ctkSliderWidget" name="localSphereRadiusFactorWidget">
         <property name="toolTip">
-         <string>Radius of the local sphere as a multiple of the vessel radius at each clip point.</string>
+         <string>Size of the local region (sphere/patch radius or box half-width) as a multiple of the vessel radius at each clip point.</string>
         </property>
         <property name="decimals">
          <number>1</number>
