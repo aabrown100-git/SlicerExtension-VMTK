@@ -284,7 +284,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.clipPointInsetFactorWidget.value = float(self._parameterNode.GetParameter("ClipPointInsetFactor"))
     self.ui.detectClipPointsButton.enabled = self._parameterNode.GetNodeReference("InputCenterlines") is not None
     self.ui.snapClipPointsToCenterlineCheckBox.checked = (self._parameterNode.GetParameter("SnapClipPointsToCenterline") == "true")
-    clippingMethod = self._parameterNode.GetParameter("ClippingMethod") or "PLANE"
+    clippingMethod = self._parameterNode.GetParameter("ClippingMethod") or "PLANE_PATCH"
     clippingMethodIndex = self.ui.clippingMethodComboBox.findData(clippingMethod)
     if clippingMethodIndex < 0:
         # Unknown value (e.g. from a scene saved by a different version): fall back to the
@@ -955,7 +955,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         cap = self._parameterNode.GetParameter("CapOutputSurface") == "true"
         addFlowExtensions = self._parameterNode.GetParameter("ExtendOutputSurface") == "true"
         extensionMode = _normalizedExtensionMode(self._parameterNode.GetParameter("ExtensionMode"))
-        clippingMethod = self._parameterNode.GetParameter("ClippingMethod") or "PLANE"
+        clippingMethod = self._parameterNode.GetParameter("ClippingMethod") or "PLANE_PATCH"
         sphereRadiusFactor = float(self._parameterNode.GetParameter("LocalSphereRadiusFactor"))
 
         slicer.util.showStatusMessage(_("Clipping model..."))
@@ -1061,7 +1061,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     if not parameterNode.GetParameter("SnapClipPointsToCenterline"):
         parameterNode.SetParameter("SnapClipPointsToCenterline", "true")
     if not parameterNode.GetParameter("ClippingMethod"):
-        parameterNode.SetParameter("ClippingMethod", "PLANE")
+        parameterNode.SetParameter("ClippingMethod", "PLANE_PATCH")
     if not parameterNode.GetParameter("LocalSphereRadiusFactor"):
         parameterNode.SetParameter("LocalSphereRadiusFactor", "2.5")
     if not parameterNode.GetParameter("FreeNormalHandle"):
@@ -1162,7 +1162,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         return None
     return centerlines.GetPoint(pointId)
 
-  def clipModel(self, surface, planeOrigin, planeNormal, localRadius=None, clippingMethod="PLANE", sphereRadiusFactor=2.5):
+  def clipModel(self, surface, planeOrigin, planeNormal, localRadius=None, clippingMethod="PLANE_PATCH", sphereRadiusFactor=2.5):
     """Remove the end region of the vessel beyond a single plane. planeNormal should point
     away from the vessel interior, toward the branch end (see orientNormalTowardBranchEnd):
     everything on that side of the plane is a candidate for removal. In a large branching
@@ -1617,7 +1617,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
 
   def clipVessel(self, surfacePolyData, centerlinesNode, clipPointsMarkupsNode, cap, addFlowExtensions,
                  extensionLength, extensionMode, manualClipPlaneNormals=None, manualClipPlaneOrigins=None,
-                 interactivePointIndex=-1, clippingMethod="PLANE", sphereRadiusFactor=2.5):
+                 interactivePointIndex=-1, clippingMethod="PLANE_PATCH", sphereRadiusFactor=2.5):
     """Clips the vessel.
     :param surfacePolyData: input surface
     :param centerlinesPolyData: input centerlines
