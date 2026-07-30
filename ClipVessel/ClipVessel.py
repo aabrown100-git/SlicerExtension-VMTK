@@ -1762,5 +1762,122 @@ class ClipVesselTest(ScriptedLoadableModuleTest):
     slicer.mrmlScene.Clear(0)
 
   def runTest(self):
-    """
-    """
+    self.setUp()
+    self.test_ClipVessel1()
+
+  def test_ClipVessel1(self):
+    """End-to-end test: download a vessel surface, extract its centerline (Extract Centerline
+    module logic, with automatic endpoint detection), detect clip points from the centerline
+    terminuses, and compute the clipped vessel with every clipping method."""
+    self.delayDisplay("Starting the test")
+
+    # Download and load the input vessel surface
+    import SampleData
+    inputSurfaceModelNode = SampleData.downloadFromURL(
+        fileNames="aorta-surface.stl",
+        nodeNames="aorta-surface",
+        uris="https://raw.githubusercontent.com/vmtk/vmtk-test-data/master/input/aorta-surface.stl")[0]
+    inputSurfacePolyData = inputSurfaceModelNode.GetPolyData()
+    self.assertGreater(inputSurfacePolyData.GetNumberOfPoints(), 0)
+
+    # Extract centerline using the Extract Centerline module logic
+    import ExtractCenterline
+    extractCenterlineLogic = ExtractCenterline.ExtractCenterlineLogic()
+
+    self.delayDisplay("Preprocessing input surface")
+    targetNumberOfPoints = 5000.0
+    decimationAggressiveness = 4.0
+    subdivideInputSurface = False
+    preprocessedPolyData = extractCenterlineLogic.preprocess(inputSurfacePolyData, targetNumberOfPoints,
+                                                             decimationAggressiveness, subdivideInputSurface)
+    self.assertGreater(preprocessedPolyData.GetNumberOfPoints(), 0)
+
+    self.delayDisplay("Detecting centerline endpoints")
+    endPointsMarkupsNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "Centerline endpoints")
+    networkPolyData = extractCenterlineLogic.extractNetwork(preprocessedPolyData, endPointsMarkupsNode)
+    endpointPositions = extractCenterlineLogic.getEndPoints(networkPolyData, startPointPosition=None)
+    # The aorta surface has one inlet and two iliac outlets
+    self.assertGreaterEqual(len(endpointPositions), 3)
+    for position in endpointPositions:
+        endPointsMarkupsNode.AddControlPoint(vtk.vtkVector3d(position))
+
+    self.delayDisplay("Extracting centerline")
+    centerlinePolyData, voronoiDiagramPolyData = extractCenterlineLogic.extractCenterline(
+        preprocessedPolyData, endPointsMarkupsNode)
+    self.assertGreater(centerlinePolyData.GetNumberOfPoints(), 0)
+    self.assertIsNotNone(centerlinePolyData.GetPointData().GetArray("Radius"))
+    centerlineModelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", "Centerline model")
+    centerlineModelNode.SetAndObserveMesh(centerlinePolyData)
+
+    # Detect clip points from the centerline terminuses (inlet + one point per outlet).
+    # The detected points lie on the centerline, pulled inward from each terminus by
+    # insetFactor times the local vessel radius. The default inset (0.5x) leaves the clip
+    # planes too close to the vessel ends on this coarsely decimated test surface (cuts can
+    # miss the surface or come out non-planar), so a larger inset is used here.
+    clipVesselLogic = ClipVesselLogic()
+    self.delayDisplay("Detecting clip points")
+    insetFactor = 1.5
+    terminuses = clipVesselLogic.detectCenterlineTerminusClipPoints(centerlineModelNode, insetFactor)
+    self.assertGreaterEqual(len(terminuses), 3)
+    clipPointsMarkupsNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "Clip points")
+    for terminus in terminuses:
+        pointIndex = clipPointsMarkupsNode.AddControlPointWorld(vtk.vtkVector3d(terminus["position"]))
+        clipPointsMarkupsNode.SetNthControlPointLabel(pointIndex, terminus["label"])
+
+    # Compute the clipped vessel
+    cap = True
+    addFlowExtensions = False
+    extensionLength = 5.0
+    extensionMode = "BOUNDARY_NORMAL"
+
+    # Clip with all clipping methods, each into its own output model node
+    for clippingMethod in ["PLANE", "PLANE_SPHERE", "PLANE_PATCH", "BOX"]:
+        self.delayDisplay("Clipping vessel (%s)" % clippingMethod)
+        outputPolyData = clipVesselLogic.clipVessel(preprocessedPolyData, centerlineModelNode, clipPointsMarkupsNode,
+                                                    cap, addFlowExtensions, extensionLength, extensionMode,
+                                                    clippingMethod=clippingMethod)
+        self.assertIsNotNone(outputPolyData)
+        self.assertGreater(outputPolyData.GetNumberOfCells(), 0)
+        # Every clip point must have produced a cut
+        self.assertEqual(clipVesselLogic.lastUnclippedPoints, [])
+        if clippingMethod != "PLANE_SPHERE":
+            # These methods cut with a plane, so every cut must be planar (planarity failures
+            # would silently disable capping) and the capped output must be watertight.
+            # PLANE_SPHERE is exempt: its cut may follow the sphere where the sphere is the
+            # active constraint, which legitimately fails the planarity check.
+            self.assertEqual(clipVesselLogic.lastPlanarityFailures, [])
+            boundaryEdges = vtk.vtkFeatureEdges()
+            boundaryEdges.SetInputData(outputPolyData)
+            boundaryEdges.BoundaryEdgesOn()
+            boundaryEdges.FeatureEdgesOff()
+            boundaryEdges.NonManifoldEdgesOff()
+            boundaryEdges.ManifoldEdgesOff()
+            boundaryEdges.Update()
+            self.assertEqual(boundaryEdges.GetOutput().GetNumberOfCells(), 0)
+        outputModelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode",
+            "Clipped vessel (%s)" % clippingMethod)
+        outputModelNode.SetAndObserveMesh(outputPolyData)
+
+    # One more clipping with flow extensions added to the open vessel ends
+    self.delayDisplay("Clipping vessel with flow extensions")
+    extendedPolyData = clipVesselLogic.clipVessel(preprocessedPolyData, centerlineModelNode, clipPointsMarkupsNode,
+                                                  cap, True, extensionLength, extensionMode)
+    self.assertIsNotNone(extendedPolyData)
+    self.assertGreater(extendedPolyData.GetNumberOfCells(), 0)
+    self.assertEqual(clipVesselLogic.lastUnclippedPoints, [])
+    # The extensions must make the model larger than the plain clipped output
+    extendedBounds = vtk.vtkBoundingBox(extendedPolyData.GetBounds())
+    clippedBounds = vtk.vtkBoundingBox(outputPolyData.GetBounds())
+    self.assertGreater(extendedBounds.GetDiagonalLength(), clippedBounds.GetDiagonalLength())
+    extendedModelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode",
+        "Clipped vessel (flow extensions)")
+    extendedModelNode.SetAndObserveMesh(extendedPolyData)
+
+    # Show all models as surface with edges
+    for modelNode in slicer.util.getNodesByClass("vtkMRMLModelNode"):
+        modelNode.CreateDefaultDisplayNodes()
+        displayNode = modelNode.GetDisplayNode()
+        displayNode.SetVisibility(True)
+        displayNode.SetEdgeVisibility(True)
+
+    self.delayDisplay("Test passed")
