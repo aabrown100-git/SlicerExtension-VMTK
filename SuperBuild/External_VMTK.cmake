@@ -99,7 +99,13 @@ if(NOT DEFINED ${proj}_DIR AND NOT ${CMAKE_PROJECT_NAME}_USE_SYSTEM_${proj})
       # installation location for all vtkvmtk stuff
       -DVTK_VMTK_INSTALL_BIN_DIR:PATH=${Slicer_INSTALL_QTLOADABLEMODULES_BIN_DIR}
       -DVTK_VMTK_INSTALL_LIB_DIR:PATH=${Slicer_INSTALL_QTLOADABLEMODULES_LIB_DIR}
-      -DVTK_VMTK_MODULE_INSTALL_LIB_DIR:PATH=${Slicer_INSTALL_QTLOADABLEMODULES_LIB_DIR}
+      # vtkvmtk.py must not be placed directly in the qt-loadable-modules folder, because
+      # Slicer would try to load it as a Python CLI module (and fail); it is not usable
+      # as a top-level module anyway (it uses relative imports), so install it into the
+      # Python subfolder to keep it out of the way of Slicer's module discovery.
+      -DVTK_VMTK_MODULE_INSTALL_LIB_DIR:PATH=${Slicer_INSTALL_QTLOADABLEMODULES_PYTHON_LIB_DIR}
+      # keep the wrapped vtkvmtk*Python modules in qt-loadable-modules (on sys.path)
+      -DVTK_VMTK_WRAPPED_MODULE_INSTALL_LIB_DIR:PATH=${Slicer_INSTALL_QTLOADABLEMODULES_LIB_DIR}
       -DVTK_VMTK_WRAP_PYTHON:BOOL=ON
       # we don't want superbuild since it will override our CMake settings
       -DVMTK_USE_SUPERBUILD:BOOL=OFF
