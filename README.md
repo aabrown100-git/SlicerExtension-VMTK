@@ -15,8 +15,8 @@ SlicerVMTK extension provides the following modules:
 
 Segmentation:
 
-  - Vesselness Filtering: Image processing operation that increases brightness of tubular structures and suppresses other shapes (plates and blobs). This module can be used to pre-process image data to make vessel segmentation easier.
-  - Level Set Segmentation: This module can segment a *single vessel branch* of a vessel tree from an image (either unprocessed or vesselness-filtered can be used). Place "Seeds" points inside vessels and place "Stoppers" points in areas to avoid (where segmentation leaked out to). To segment multiple branches, you can use Segment Editor module.
+  - [Vesselness Filtering](Docs/VesselnessFiltering.md): Image processing operation that increases brightness of tubular structures and suppresses other shapes (plates and blobs). This module can be used to pre-process image data to make vessel segmentation easier.
+  - [Level Set Segmentation](Docs/LevelSetSegmentation.md): This module can segment a *single vessel branch* of a vessel tree from an image (either unprocessed or vesselness-filtered can be used). Place "Seeds" points inside vessels and place "Stoppers" points in areas to avoid (where segmentation leaked out to). To segment multiple branches, you can use Segment Editor module.
 
 Analysis:
 
@@ -42,6 +42,10 @@ Legacy modules (replaced by other modules, not developed anymore):
   - [Centerline Computation](Docs/CenterlineComputation.md): This module determines centerlines in a vessel tree from an input model node. *This module is replaced by the much improved, faster and more robust "Extract Centerline" module in current Slicer versions (Slicer-4.11 and later).*
 
 ![](Docs/CenterlineComputationOutput1.png)
+
+# Tutorials
+
+  - [Coronary artery centerline extraction](Docs/CoronaryArteryCenterlineExtraction.md): End-to-end walkthrough of segmenting a coronary artery from a CT angiogram and extracting its centerline, using vesselness filtering, level set segmentation, and centerline extraction.
 
 # Advanced analysis
 
