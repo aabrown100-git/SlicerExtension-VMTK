@@ -1,11 +1,25 @@
 import json
 import logging
 import vtk, qt, slicer
+from slicer.i18n import tr as _
+from slicer.i18n import translate
 import numpy as np
 from vtk.util.numpy_support import vtk_to_numpy
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 import vtkvmtkComputationalGeometryPython as vtkvmtkComputationalGeometry
+
+# Older scenes stored lowercase keywords in the parameter node; map those legacy values
+# to the current identifiers when reading.
+_LEGACY_EXTENSION_MODE_IDS = {
+    "centerlinedirection": "CENTERLINE_DIRECTION",
+    "boundarynormal": "BOUNDARY_NORMAL",
+    "linear": "LINEAR",
+    "thinplatespline": "THIN_PLATE_SPLINE",
+}
+
+def _normalizedExtensionMode(value):
+    return _LEGACY_EXTENSION_MODE_IDS.get(value, value)
 
 """
   ClipVessel
@@ -18,17 +32,17 @@ class ClipVessel(ScriptedLoadableModule):
 
   def __init__(self, parent):
     ScriptedLoadableModule.__init__(self, parent)
-    self.parent.title = "Clip Vessel"
-    self.parent.categories = ["Vascular Modeling Toolkit"]
+    self.parent.title = _("Clip Vessel")
+    self.parent.categories = [translate("qSlicerAbstractCoreModule", "Vascular Modeling Toolkit")]
     self.parent.dependencies = []
     self.parent.contributors = ["David Molony (NGHS)", "Andras Lasso (PerkLab)"]
-    self.parent.helpText = """
+    self.parent.helpText = _("""
 This module clips a surface model given a VMTK centerline and markups indicating where the model will be clipped. The first marker indicates the inlet. Optionally, the user can cap and add flow extensions.
     Documentation is available <a href="https://github.com/vmtk/SlicerExtension-VMTK/blob/ClipVessel/Docs/ClipVessel.md">here</a>.
-"""
-    self.parent.acknowledgementText = """
+""")
+    self.parent.acknowledgementText = _("""
 This file was developed by David Molony, Georgia Heart Institute, Northeast Georgia Health System and was partially funded by NIH grant R01 HL118019.
-"""  # TODO: replace with organization, grant and thanks.
+""")
 
 #
 # ClipVesselWidget
@@ -96,9 +110,9 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.autoApplyTimer.connect("timeout()", self.onAutoApplyTimeout)
 
     self.inputVisibilityButtons = [
-        (self.ui.toggleInputSurfaceVisibilityButton, "InputSurface", "input surface"),
-        (self.ui.toggleCenterlinesVisibilityButton, "InputCenterlines", "centerlines"),
-        (self.ui.toggleClipPointsVisibilityButton, "ClipPoints", "clip points"),
+        (self.ui.toggleInputSurfaceVisibilityButton, "InputSurface", _("input surface")),
+        (self.ui.toggleCenterlinesVisibilityButton, "InputCenterlines", _("centerlines")),
+        (self.ui.toggleClipPointsVisibilityButton, "ClipPoints", _("clip points")),
     ]
 
     self.setParameterNode(self.logic.getParameterNode())
@@ -115,11 +129,19 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.decimationAggressivenessWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
     self.ui.extensionLengthWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
     self.ui.inputSegmentSelectorWidget.connect('currentSegmentChanged(QString)', self.updateParameterNodeFromGUI)
-    self.ui.extensionModeComboBox.addItems(["centerlinedirection", "boundarynormal", "linear", "thinplatespline"])
+    # Combobox item data holds a stable, non-translated identifier that is stored in the
+    # parameter node (and used by the logic); only the displayed item text is translatable.
+    self.ui.extensionModeComboBox.addItem(_("Centerline direction"), "CENTERLINE_DIRECTION")
+    self.ui.extensionModeComboBox.addItem(_("Boundary normal"), "BOUNDARY_NORMAL")
+    self.ui.extensionModeComboBox.addItem(_("Linear"), "LINEAR")
+    self.ui.extensionModeComboBox.addItem(_("Thin plate spline"), "THIN_PLATE_SPLINE")
     self.ui.extensionModeComboBox.connect('currentIndexChanged(int)', self.updateParameterNodeFromGUI)
     self.ui.extensionModeComboBox.setCurrentIndex(1)
     self.ui.clipPointInsetFactorWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
-    self.ui.clippingMethodComboBox.addItems(["Plane", "Plane + local sphere", "Plane + local patch", "Plane + local box"])
+    self.ui.clippingMethodComboBox.addItem(_("Plane"), "PLANE")
+    self.ui.clippingMethodComboBox.addItem(_("Plane + sphere"), "PLANE_SPHERE")
+    self.ui.clippingMethodComboBox.addItem(_("Plane + patch"), "PLANE_PATCH")
+    self.ui.clippingMethodComboBox.addItem(_("Box"), "BOX")
     self.ui.clippingMethodComboBox.connect('currentIndexChanged(int)', self.onClippingMethodChanged)
     self.ui.localSphereRadiusFactorWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
     self.ui.freeNormalHandleCheckBox.connect("toggled(bool)", self.onFreeNormalHandleToggled)
@@ -243,15 +265,23 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.capOutputSurfaceModelCheckBox.checked = (self._parameterNode.GetParameter("CapOutputSurface") == "true")    
     self.ui.addFlowExtensionsCheckBox.checked = (self._parameterNode.GetParameter("ExtendOutputSurface") == "true")    
     self.ui.extensionLengthWidget.value = float(self._parameterNode.GetParameter("ExtensionLength"))
-    self.ui.extensionModeComboBox.currentText = self._parameterNode.GetParameter("ExtensionMode")
+    extensionModeIndex = self.ui.extensionModeComboBox.findData(_normalizedExtensionMode(self._parameterNode.GetParameter("ExtensionMode")))
+    if extensionModeIndex >= 0:
+        self.ui.extensionModeComboBox.currentIndex = extensionModeIndex
     autoApply = self._parameterNode.GetParameter("AutoApplyPlane") == "true"
     self.ui.applyButton.checkable = autoApply
     self.ui.applyButton.checked = autoApply
     self.ui.clipPointInsetFactorWidget.value = float(self._parameterNode.GetParameter("ClipPointInsetFactor"))
     self.ui.detectClipPointsButton.enabled = self._parameterNode.GetNodeReference("InputCenterlines") is not None
     self.ui.snapClipPointsToCenterlineCheckBox.checked = (self._parameterNode.GetParameter("SnapClipPointsToCenterline") == "true")
-    clippingMethod = self._parameterNode.GetParameter("ClippingMethod") or "Plane"
-    self.ui.clippingMethodComboBox.currentText = clippingMethod
+    clippingMethod = self._parameterNode.GetParameter("ClippingMethod") or "PLANE"
+    clippingMethodIndex = self.ui.clippingMethodComboBox.findData(clippingMethod)
+    if clippingMethodIndex < 0:
+        # Unknown value (e.g. from a scene saved by a different version): fall back to the
+        # first method and keep the rest of the GUI consistent with that choice.
+        clippingMethodIndex = 0
+        clippingMethod = self.ui.clippingMethodComboBox.itemData(clippingMethodIndex)
+    self.ui.clippingMethodComboBox.currentIndex = clippingMethodIndex
     self.ui.localSphereRadiusFactorWidget.value = float(self._parameterNode.GetParameter("LocalSphereRadiusFactor"))
     self.updateClippingMethodUI(clippingMethod)
     self.ui.freeNormalHandleCheckBox.checked = (self._parameterNode.GetParameter("FreeNormalHandle") == "true")
@@ -264,20 +294,20 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     if self.logic.lastPlanarityFailures:
         failedLabels = [result["label"] for result in self.logic.lastPlanarityFailures]
-        self.ui.clipStatusLabel.text = "Non-planar cuts: " + ", ".join(failedLabels)
+        self.ui.clipStatusLabel.text = _("Non-planar cuts: {failed_labels}").format(failed_labels=", ".join(failedLabels))
         self.ui.clipStatusLabel.styleSheet = "QLabel { color: #d08000; }"
     elif self.logic.lastPlanarityResults:
-        self.ui.clipStatusLabel.text = "All cuts are planar."
+        self.ui.clipStatusLabel.text = _("All cuts are planar.")
         self.ui.clipStatusLabel.styleSheet = "QLabel { color: #008000; }"
     else:
-        self.ui.clipStatusLabel.text = "Click a clip point to show and adjust its clip plane."
+        self.ui.clipStatusLabel.text = _("Click a clip point to show and adjust its clip plane.")
     
     # Update buttons states and tooltips
     if self._parameterNode.GetNodeReference("InputSurface") and self._parameterNode.GetNodeReference("InputCenterlines") and self._parameterNode.GetNodeReference("ClipPoints") and self._parameterNode.GetNodeReference("OutputSurfaceModel"):
-        self.ui.applyButton.toolTip = "Clip vessel"
+        self.ui.applyButton.toolTip = _("Clip vessel")
         self.ui.applyButton.enabled = True
     else:
-        self.ui.applyButton.toolTip = "Select input and output model nodes"
+        self.ui.applyButton.toolTip = _("Select input and output model nodes")
         self.ui.applyButton.enabled = False
 
     self.updatingGUIFromParameterNode = False
@@ -326,11 +356,11 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self._parameterNode.SetParameter("CapOutputSurface", "true" if self.ui.capOutputSurfaceModelCheckBox.checked else "false")
     self._parameterNode.SetParameter("ExtendOutputSurface", "true" if self.ui.addFlowExtensionsCheckBox.checked else "false")
     self._parameterNode.SetParameter("ExtensionLength", str(self.ui.extensionLengthWidget.value))
-    self._parameterNode.SetParameter("ExtensionMode", self.ui.extensionModeComboBox.currentText)
+    self._parameterNode.SetParameter("ExtensionMode", self.ui.extensionModeComboBox.currentData)
     self._parameterNode.SetParameter("AutoApplyPlane", "true" if self.ui.applyButton.checked else "false")
     self._parameterNode.SetParameter("ClipPointInsetFactor", str(self.ui.clipPointInsetFactorWidget.value))
     self._parameterNode.SetParameter("SnapClipPointsToCenterline", "true" if self.ui.snapClipPointsToCenterlineCheckBox.checked else "false")
-    self._parameterNode.SetParameter("ClippingMethod", self.ui.clippingMethodComboBox.currentText)
+    self._parameterNode.SetParameter("ClippingMethod", self.ui.clippingMethodComboBox.currentData)
     self._parameterNode.SetParameter("LocalSphereRadiusFactor", str(self.ui.localSphereRadiusFactorWidget.value))
     self._parameterNode.SetParameter("FreeNormalHandle", "true" if self.ui.freeNormalHandleCheckBox.checked else "false")
     self._parameterNode.EndModify(wasModify)
@@ -367,18 +397,18 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
   def onClippingMethodChanged(self, index=None):
     self.updateParameterNodeFromGUI()
-    self.updateClippingMethodUI(self.ui.clippingMethodComboBox.currentText)
+    self.updateClippingMethodUI(self.ui.clippingMethodComboBox.currentData)
 
   def updateClippingMethodUI(self, clippingMethod):
-    localMethod = clippingMethod in ("Plane + local sphere", "Plane + local patch", "Plane + local box")
+    localMethod = clippingMethod in ("PLANE_SPHERE", "PLANE_PATCH", "BOX")
     self.ui.localSphereRadiusFactorLabel.setVisible(localMethod)
     self.ui.localSphereRadiusFactorWidget.setVisible(localMethod)
-    if clippingMethod == "Plane + local box":
-        self.ui.localSphereRadiusFactorLabel.text = "Local box size:"
-    elif clippingMethod == "Plane + local patch":
-        self.ui.localSphereRadiusFactorLabel.text = "Local patch radius:"
+    if clippingMethod == "BOX":
+        self.ui.localSphereRadiusFactorLabel.text = _("Local box size:")
+    elif clippingMethod == "PLANE_PATCH":
+        self.ui.localSphereRadiusFactorLabel.text = _("Local patch radius:")
     else:
-        self.ui.localSphereRadiusFactorLabel.text = "Local sphere radius:"
+        self.ui.localSphereRadiusFactorLabel.text = _("Local sphere radius:")
 
   def updatePlaneHandleMode(self):
     planeNode = self._parameterNode.GetNodeReference("ManualClipPlane") if self._parameterNode else None
@@ -445,7 +475,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     visible = displayNode.GetVisibility() if displayNode else True
     wasBlocked = self.ui.toggleOutputVisibilityButton.blockSignals(True)
     self.ui.toggleOutputVisibilityButton.checked = visible
-    self.ui.toggleOutputVisibilityButton.toolTip = "Hide output surface" if visible else "Show output surface"
+    self.ui.toggleOutputVisibilityButton.toolTip = _("Hide output surface") if visible else _("Show output surface")
     self.ui.toggleOutputVisibilityButton.blockSignals(wasBlocked)
 
   def onToggleOutputVisibilityButton(self, checked=None):
@@ -453,7 +483,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     displayNode = outputModelNode.GetDisplayNode() if outputModelNode else None
     if displayNode:
         displayNode.SetVisibility(checked)
-    self.ui.toggleOutputVisibilityButton.toolTip = "Hide output surface" if checked else "Show output surface"
+    self.ui.toggleOutputVisibilityButton.toolTip = _("Hide output surface") if checked else _("Show output surface")
 
   def updateOutputEdgesButton(self):
     """Sync the Outputs edge toggle with the output model display node."""
@@ -479,7 +509,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         visible = displayNode.GetVisibility() if displayNode else True
         wasBlocked = button.blockSignals(True)
         button.checked = visible
-        button.toolTip = "Hide %s" % objectName if visible else "Show %s" % objectName
+        button.toolTip = (_("Hide {object_name}") if visible else _("Show {object_name}")).format(object_name=objectName)
         button.blockSignals(wasBlocked)
 
   def onToggleNodeVisibility(self, roleName, checked, button, objectName):
@@ -487,7 +517,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     displayNode = node.GetDisplayNode() if node else None
     if displayNode:
         displayNode.SetVisibility(checked)
-    button.toolTip = "Hide %s" % objectName if checked else "Show %s" % objectName
+    button.toolTip = (_("Hide {object_name}") if checked else _("Show {object_name}")).format(object_name=objectName)
 
   def finishPlaneEditing(self):
     """Hide temporary plane markups and leave interactive plane editing mode."""
@@ -500,7 +530,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self._activeClipPointIndex = -1
     self._planeEditing = False
     self.ui.finishPlaneEditingButton.enabled = False
-    self.ui.clipStatusLabel.text = "Plane editing finished. Click a clip point to edit another plane."
+    self.ui.clipStatusLabel.text = _("Plane editing finished. Click a clip point to edit another plane.")
     self.ui.clipStatusLabel.styleSheet = ""
 
   def observeInteractivePlaneNode(self, planeNode):
@@ -629,7 +659,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     normalHandleNode.RemoveAllControlPoints()
     normalHandlePoint = [origin[axis] + normal[axis] * self._normalHandleDistance for axis in range(3)]
     normalHandleNode.AddControlPointWorld(vtk.vtkVector3d(normalHandlePoint))
-    normalHandleNode.SetNthControlPointLabel(0, "Normal")
+    normalHandleNode.SetNthControlPointLabel(0, _("Normal"))
     normalHandleNode.EndModify(handleWasModify)
     normalHandleNode.SetDisplayVisibility(True)
     self.updatePlaneHandleMode()
@@ -637,9 +667,9 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     slicer.modules.markups.logic().SetActiveListID(planeNode)
     self.ui.finishPlaneEditingButton.enabled = True
-    self.ui.clipStatusLabel.text = "Adjusting %s: drag the center point to move it, or drag the orange handle to set the normal.%s" % (
-        clipPointsNode.GetNthControlPointLabel(pointIndex),
-        " Changes apply when released." if self.ui.applyButton.checked else " Click Apply when ready.")
+    applyHint = _("Changes apply when released.") if self.ui.applyButton.checked else _("Click Apply when ready.")
+    self.ui.clipStatusLabel.text = _("Adjusting {point_label}: drag the center point to move it, or drag the orange handle to set the normal. {apply_hint}").format(
+        point_label=clipPointsNode.GetNthControlPointLabel(pointIndex), apply_hint=applyHint)
     self.ui.clipStatusLabel.styleSheet = ""
 
   def onInteractivePlaneModified(self, caller=None, event=None):
@@ -750,27 +780,27 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         return
     centerlinesNode = self._parameterNode.GetNodeReference("InputCenterlines")
     if not centerlinesNode:
-        slicer.util.errorDisplay("Select input centerlines first.")
+        slicer.util.errorDisplay(_("Select input centerlines first."))
         return
 
     insetFactor = self.ui.clipPointInsetFactorWidget.value
     try:
         terminuses = self.logic.detectCenterlineTerminusClipPoints(centerlinesNode, insetFactor)
     except Exception as e:
-        slicer.util.errorDisplay("Failed to detect clip points: " + str(e))
+        slicer.util.errorDisplay(_("Failed to detect clip points: {message}").format(message=str(e)))
         return
     if not terminuses:
-        slicer.util.errorDisplay("Could not detect any centerline terminuses. Check the input centerlines.")
+        slicer.util.errorDisplay(_("Could not detect any centerline terminuses. Check the input centerlines."))
         return
 
     clipPointsNode = self._parameterNode.GetNodeReference("ClipPoints")
     if not clipPointsNode:
-        clipPointsNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "Clip points")
+        clipPointsNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", _("Clip points"))
         self._parameterNode.SetNodeReferenceID("ClipPoints", clipPointsNode.GetID())
     elif clipPointsNode.GetNumberOfControlPoints() > 0:
         if not slicer.util.confirmYesNoDisplay(
-                "This will replace the %d existing clip point(s) with points detected from the centerline. Continue?"
-                % clipPointsNode.GetNumberOfControlPoints()):
+                _("This will replace the {point_count} existing clip point(s) with points detected from the centerline. Continue?")
+                .format(point_count=clipPointsNode.GetNumberOfControlPoints())):
             return
 
     # Stop showing/adjusting whatever plane was up before the points underneath it are replaced.
@@ -798,8 +828,8 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.saveManualPlaneNormals()
 
     self.updateGUIFromParameterNode()
-    self.ui.clipStatusLabel.text = "Detected %d clip point(s) from the centerline (inlet + %d outlet(s))." % (
-        len(terminuses), len(terminuses) - 1)
+    self.ui.clipStatusLabel.text = _("Detected {point_count} clip point(s) from the centerline (inlet + {outlet_count} outlet(s)).").format(
+        point_count=len(terminuses), outlet_count=len(terminuses) - 1)
     self.ui.clipStatusLabel.styleSheet = "QLabel { color: #008000; }"
 
   def scheduleAutoApply(self):
@@ -815,7 +845,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
   def getPreprocessedPolyData(self):
     inputSurfaceNode = self._parameterNode.GetNodeReference("InputSurface")
     if not inputSurfaceNode:
-        raise ValueError("Valid input surface is required")
+        raise ValueError(_("Valid input surface is required"))
     segmentId = self._parameterNode.GetParameter("InputSegmentID")
 
     # Cheap staleness check BEFORE materializing the input surface. For a segmentation node,
@@ -841,7 +871,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     inputSurfacePolyData = self.logic.polyDataFromNode(inputSurfaceNode, segmentId)
     if not inputSurfacePolyData or inputSurfacePolyData.GetNumberOfPoints() == 0:
-        raise ValueError("Valid input surface is required")
+        raise ValueError(_("Valid input surface is required"))
 
     if not preprocessEnabled:
         resultPolyData = inputSurfacePolyData
@@ -868,7 +898,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
     try:
         # Preprocessing
-        slicer.util.showStatusMessage("Preprocessing...")
+        slicer.util.showStatusMessage(_("Preprocessing..."))
         slicer.app.processEvents()  # force update
         preprocessedPolyData = self.getPreprocessedPolyData()
         # Save preprocessing result to model node. Skip the (surprisingly non-trivial)
@@ -893,11 +923,11 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # synchronizing after a saved scene is restored.
         cap = self._parameterNode.GetParameter("CapOutputSurface") == "true"
         addFlowExtensions = self._parameterNode.GetParameter("ExtendOutputSurface") == "true"
-        extensionMode = self._parameterNode.GetParameter("ExtensionMode")
-        clippingMethod = self._parameterNode.GetParameter("ClippingMethod") or "Plane"
+        extensionMode = _normalizedExtensionMode(self._parameterNode.GetParameter("ExtensionMode"))
+        clippingMethod = self._parameterNode.GetParameter("ClippingMethod") or "PLANE"
         sphereRadiusFactor = float(self._parameterNode.GetParameter("LocalSphereRadiusFactor"))
 
-        slicer.util.showStatusMessage("Clipping model...")
+        slicer.util.showStatusMessage(_("Clipping model..."))
         slicer.app.processEvents()  # force update
 
         outputPolyData = self.logic.clipVessel(preprocessedPolyData, centerlinesModelNode, clipPointsMarkupsNode,
@@ -914,25 +944,25 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.updateOutputEdgesButton()
 
         if self.logic.lastUnclippedPoints:
-            self.ui.clipStatusLabel.text = ("No cut made at: " + ", ".join(self.logic.lastUnclippedPoints) +
-                ". These points are positioned exactly at, or beyond, the vessel end — move them slightly inward.")
+            self.ui.clipStatusLabel.text = _("No cut made at: {point_labels}. These points are positioned exactly at, or beyond, the vessel end — move them slightly inward.").format(
+                point_labels=", ".join(self.logic.lastUnclippedPoints))
             self.ui.clipStatusLabel.styleSheet = "QLabel { color: #d08000; }"
         elif self.logic.lastPlanarityFailures:
             failedLabels = [result["label"] for result in self.logic.lastPlanarityFailures]
-            self.ui.clipStatusLabel.text = "Capping skipped; non-planar cuts: " + ", ".join(failedLabels)
+            self.ui.clipStatusLabel.text = _("Capping skipped; non-planar cuts: {failed_labels}").format(failed_labels=", ".join(failedLabels))
             self.ui.clipStatusLabel.styleSheet = "QLabel { color: #d08000; }"
         else:
-            self.ui.clipStatusLabel.text = "All cuts are planar."
+            self.ui.clipStatusLabel.text = _("All cuts are planar.")
             self.ui.clipStatusLabel.styleSheet = "QLabel { color: #008000; }"
 
     except Exception as e:
-        slicer.util.errorDisplay("Failed to compute results: "+str(e))
+        slicer.util.errorDisplay(_("Failed to compute results: {message}").format(message=str(e)))
         import traceback
         traceback.print_exc()
     finally:
         qt.QApplication.restoreOverrideCursor()
         self._applying = False
-    slicer.util.showStatusMessage("Clipping vessel complete.", 3000)
+    slicer.util.showStatusMessage(_("Clipping vessel complete."), 3000)
 
 #
 # ClipVesselLogic
@@ -1000,7 +1030,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     if not parameterNode.GetParameter("SnapClipPointsToCenterline"):
         parameterNode.SetParameter("SnapClipPointsToCenterline", "true")
     if not parameterNode.GetParameter("ClippingMethod"):
-        parameterNode.SetParameter("ClippingMethod", "Plane")
+        parameterNode.SetParameter("ClippingMethod", "PLANE")
     if not parameterNode.GetParameter("LocalSphereRadiusFactor"):
         parameterNode.SetParameter("LocalSphereRadiusFactor", "2.5")
     if not parameterNode.GetParameter("FreeNormalHandle"):
@@ -1101,7 +1131,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         return None
     return centerlines.GetPoint(pointId)
 
-  def clipModel(self, surface, planeOrigin, planeNormal, localRadius=None, clippingMethod="Plane", sphereRadiusFactor=2.5):
+  def clipModel(self, surface, planeOrigin, planeNormal, localRadius=None, clippingMethod="PLANE", sphereRadiusFactor=2.5):
     """Remove the end region of the vessel beyond a single plane. planeNormal should point
     away from the vessel interior, toward the branch end (see orientNormalTowardBranchEnd):
     everything on that side of the plane is a candidate for removal. In a large branching
@@ -1114,14 +1144,14 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     the clip point sits exactly at, or beyond, the vessel end). reason is None when clipped
     is True. Whether a cut that DID happen looks right is left to the user to judge (e.g. via
     the output status/visualization) rather than rejected automatically here.
-    clippingMethod selects how the cut is confined: "Plane" clips with the infinite plane and
-    relies on connectivity alone. "Plane + local sphere" clips with the intersection of the
+    clippingMethod selects how the cut is confined: "PLANE" clips with the infinite plane and
+    relies on connectivity alone. "PLANE_SPHERE" clips with the intersection of the
     plane and a sphere of radius sphereRadiusFactor*localRadius around planeOrigin; this
     confines the cut, but also cuts and re-stitches the mesh along the sphere surface, which
-    can leave a visible seam ring on the vessel wall. "Plane + local patch" achieves the same
+    can leave a visible seam ring on the vessel wall. "PLANE_PATCH" achieves the same
     confinement without a seam: the plain-plane cut is restricted to whole cells within the
     same sphere, so no new points are created at the sphere boundary and the cut stays exactly
-    planar. "Plane + local box" clips with an open-ended oriented box whose base face lies
+    planar. "BOX" clips with an open-ended oriented box whose base face lies
     exactly in the cut plane (lateral half-width sphereRadiusFactor*localRadius), which keeps
     the cut planar while confining it laterally - but the box side faces will cut (and leave
     seams on) anything they happen to pass through."""
@@ -1129,10 +1159,10 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     clipFunctionPlane.SetOrigin(planeOrigin)
     clipFunctionPlane.SetNormal(planeNormal)
 
-    # "Plane + local patch" limits the cut to a neighborhood around the selected vessel end.
+    # "Plane + patch" limits the cut to a neighborhood around the selected vessel end.
     # The mesh is partitioned into whole cells near the clip point (the local patch) and the
     # untouched remainder, and only the patch is clipped with the plain plane. Unlike the
-    # "Plane + local sphere" implicit intersection below, this never cuts the mesh open along
+    # "Plane + sphere" implicit intersection below, this never cuts the mesh open along
     # the sphere itself (where vtkSphere's quadratic function also misplaces the linearly
     # interpolated cut points), so no seam ring appears on the vessel wall. The whole-cell
     # partition creates no new points at the sphere boundary, so patch and remainder share
@@ -1140,7 +1170,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     # exactly planar.
     remainderSurface = None
     clipInputSurface = surface
-    if clippingMethod == "Plane + local patch" and localRadius and localRadius > 0:
+    if clippingMethod == "PLANE_PATCH" and localRadius and localRadius > 0:
         localSphere = vtk.vtkSphere()
         localSphere.SetCenter(planeOrigin)
         localSphere.SetRadius(max(localRadius * sphereRadiusFactor, 1.0))
@@ -1166,7 +1196,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         clipInputSurface = patchExtractor.GetOutput()
         remainderSurface = remainderExtractor.GetOutput()
 
-    # "Plane + local box" confines the cut with a single oriented box whose base face lies
+    # "Box" confines the cut with a single oriented box whose base face lies
     # exactly in the cut plane and which extends past the vessel end. The only place its
     # boundary should meet the surface is that flat base face, so the cut stays planar and
     # seam-free without cutting the mesh along a sphere - provided the side faces clear the
@@ -1177,11 +1207,11 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     # clipped output. For the box, the discard region is the box interior (negative function
     # values), so InsideOut is off to retain the exterior instead.
     clipInsideOut = 1
-    if clippingMethod == "Plane + local sphere" and localRadius and localRadius > 0:
+    if clippingMethod == "PLANE_SPHERE" and localRadius and localRadius > 0:
         # Limit the implicit cut to a neighborhood around the selected vessel end by
         # intersecting the plane with a sphere. This also cuts and re-stitches the mesh
         # along the sphere surface, which can leave a visible seam ring on the vessel wall;
-        # "Plane + local patch" (above) is the seam-free alternative.
+        # "Plane + patch" (above) is the seam-free alternative.
         localSphere = vtk.vtkSphere()
         localSphere.SetCenter(planeOrigin)
         localSphere.SetRadius(max(localRadius * sphereRadiusFactor, 1.0))
@@ -1190,7 +1220,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         sphereImplicitFunction.AddFunction(clipFunctionPlane)
         sphereImplicitFunction.AddFunction(localSphere)
         clipFunction = sphereImplicitFunction
-    if clippingMethod == "Plane + local box" and localRadius and localRadius > 0:
+    if clippingMethod == "BOX" and localRadius and localRadius > 0:
         boxAxisZ = list(planeNormal)
         vtk.vtkMath.Normalize(boxAxisZ)
         boxAxisX = [0.0, 0.0, 0.0]
@@ -1339,7 +1369,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     tangentArray = centerlines.GetPointData().GetArray("FrenetTangent")
     radiusArray = centerlines.GetPointData().GetArray(self.radiusArrayName)
     if tangentArray is None or radiusArray is None:
-        raise ValueError("Centerline is missing tangent/radius information. Re-run centerline extraction and try again.")
+        raise ValueError(_("Centerline is missing tangent/radius information. Re-run centerline extraction and try again."))
 
     cellEndpointIds = []
     for cellIndex in range(numberOfCells):
@@ -1402,7 +1432,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         rootPointId = cellEndpointIds[firstCellIndex][0]
         rootPosition, rootNormal = insetFromEndpoint(centerlines.GetCell(firstCellIndex), 0, +1)
 
-    terminuses = [{"label": "Inlet", "position": rootPosition, "normal": rootNormal}]
+    terminuses = [{"label": _("Inlet"), "position": rootPosition, "normal": rootNormal}]
 
     seenLeafPositions = []
     outletNumber = 0
@@ -1426,7 +1456,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         outletNumber += 1
         step = -1 if leafOffset == numberOfPoints - 1 else +1
         outletPosition, outletNormal = insetFromEndpoint(cell, leafOffset, step)
-        terminuses.append({"label": f"Outlet {outletNumber}", "position": outletPosition, "normal": outletNormal})
+        terminuses.append({"label": _("Outlet {number}").format(number=outletNumber), "position": outletPosition, "normal": outletNormal})
 
     return terminuses
 
@@ -1543,20 +1573,20 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     extensionsFilter.SetTransitionRatio(self.TransitionRatio)
     extensionsFilter.SetCenterlineNormalEstimationDistanceRatio(self.CenterlineNormalEstimationDistanceRatio)
     extensionsFilter.SetNumberOfBoundaryPoints(self.TargetNumberOfBoundaryPoints)
-    if extensionMode == "centerlinedirection":
+    if extensionMode == "CENTERLINE_DIRECTION":
         extensionsFilter.SetExtensionModeToUseCenterlineDirection()
-    elif extensionMode == "boundarynormal":
+    elif extensionMode == "BOUNDARY_NORMAL":
         extensionsFilter.SetExtensionModeToUseNormalToBoundary()
-    if extensionMode == "linear":
+    if extensionMode == "LINEAR":
         extensionsFilter.SetInterpolationModeToLinear()
-    elif extensionMode == "thinplatespline":
+    elif extensionMode == "THIN_PLATE_SPLINE":
         extensionsFilter.SetInterpolationModeToThinPlateSpline()
     extensionsFilter.Update()
     return extensionsFilter.GetOutput()
 
   def clipVessel(self, surfacePolyData, centerlinesNode, clipPointsMarkupsNode, cap, addFlowExtensions,
                  extensionLength, extensionMode, manualClipPlaneNormals=None, manualClipPlaneOrigins=None,
-                 interactivePointIndex=-1, clippingMethod="Plane", sphereRadiusFactor=2.5):
+                 interactivePointIndex=-1, clippingMethod="PLANE", sphereRadiusFactor=2.5):
     """Clips the vessel.
     :param surfacePolyData: input surface
     :param centerlinesPolyData: input centerlines
@@ -1572,7 +1602,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
 
     numberOfControlPoints = clipPointsMarkupsNode.GetNumberOfControlPoints()
     if numberOfControlPoints == 0:
-        raise ValueError("Failed to clip vessel (no output was generated)")
+        raise ValueError(_("Failed to clip vessel (no output was generated)"))
 
     # identify closest point on centerline to clipPointsMarkups
     pointLocator = vtk.vtkPointLocator()
@@ -1668,13 +1698,13 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         cap = False
 
     if addFlowExtensions:
-        slicer.util.showStatusMessage("Adding extensions...")
+        slicer.util.showStatusMessage(_("Adding extensions..."))
         slicer.app.processEvents() 
         surface = self.extendVessel(surface, centerlinesPolyData, extensionLength, extensionMode)
 
     # Cap all the holes that are in the surface
     if cap:
-        slicer.util.showStatusMessage("Capping surface...")
+        slicer.util.showStatusMessage(_("Capping surface..."))
         slicer.app.processEvents() 
         surface = self.capSurface(surface)
 

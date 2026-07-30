@@ -6,12 +6,44 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>422</width>
-    <height>621</height>
+    <width>550</width>
+    <height>759</height>
    </rect>
   </property>
-  <layout class="QFormLayout" name="formLayout">
-   <item row="1" column="0" colspan="2">
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <item>
+    <layout class="QHBoxLayout" name="horizontalLayout">
+     <item>
+      <widget class="QLabel" name="parameterSetLabel">
+       <property name="text">
+        <string>Parameter set: </string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="qMRMLNodeComboBox" name="parameterNodeSelector">
+       <property name="toolTip">
+        <string>Pick node to store parameter set</string>
+       </property>
+       <property name="nodeTypes">
+        <stringlist>
+         <string notr="true">vtkMRMLScriptedModuleNode</string>
+        </stringlist>
+       </property>
+       <property name="showHidden">
+        <bool>true</bool>
+       </property>
+       <property name="baseName">
+        <string notr="true">ClipVessel</string>
+       </property>
+       <property name="renameEnabled">
+        <bool>true</bool>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
     <widget class="ctkCollapsibleButton" name="inputsCollapsibleButton">
      <property name="text">
       <string>Inputs</string>
@@ -33,8 +65,8 @@
           </property>
           <property name="nodeTypes">
            <stringlist>
-            <string>vtkMRMLModelNode</string>
-            <string>vtkMRMLSegmentationNode</string>
+            <string notr="true">vtkMRMLModelNode</string>
+            <string notr="true">vtkMRMLSegmentationNode</string>
            </stringlist>
           </property>
           <property name="showChildNodeTypes">
@@ -62,100 +94,28 @@
           <property name="toolTip">
            <string>Show or hide the input surface</string>
           </property>
-          <property name="toolButtonStyle">
-           <enum>Qt::ToolButtonIconOnly</enum>
-          </property>
-          <property name="autoRaise">
-           <bool>true</bool>
-          </property>
           <property name="checkable">
            <bool>true</bool>
           </property>
           <property name="checked">
            <bool>true</bool>
           </property>
+          <property name="toolButtonStyle">
+           <enum>Qt::ToolButtonIconOnly</enum>
+          </property>
+          <property name="autoRaise">
+           <bool>true</bool>
+          </property>
          </widget>
         </item>
        </layout>
       </item>
-      <item row="3" column="0">
-       <widget class="QLabel" name="label_9">
-        <property name="text">
-         <string>Clip points:</string>
+      <item row="1" column="1">
+       <widget class="qMRMLSegmentSelectorWidget" name="inputSegmentSelectorWidget">
+        <property name="segmentationNodeSelectorVisible">
+         <bool>false</bool>
         </property>
        </widget>
-      </item>
-      <item row="3" column="1">
-       <layout class="QHBoxLayout" name="horizontalLayout_2">
-        <item>
-         <widget class="qMRMLNodeComboBox" name="clipPointsMarkupsSelector">
-          <property name="toolTip">
-           <string>Branch clippoints. The first point is interpreted as the model inlet.</string>
-          </property>
-          <property name="nodeTypes">
-           <stringlist>
-            <string>vtkMRMLMarkupsFiducialNode</string>
-           </stringlist>
-          </property>
-          <property name="showChildNodeTypes">
-           <bool>false</bool>
-          </property>
-          <property name="baseName">
-           <string>Clip points</string>
-          </property>
-          <property name="noneEnabled">
-           <bool>true</bool>
-          </property>
-          <property name="addEnabled">
-           <bool>true</bool>
-          </property>
-          <property name="removeEnabled">
-           <bool>true</bool>
-          </property>
-          <property name="editEnabled">
-           <bool>true</bool>
-          </property>
-          <property name="renameEnabled">
-           <bool>true</bool>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QToolButton" name="toggleClipPointsVisibilityButton">
-          <property name="enabled">
-           <bool>false</bool>
-          </property>
-          <property name="toolTip">
-           <string>Show or hide the clip points</string>
-          </property>
-          <property name="toolButtonStyle">
-           <enum>Qt::ToolButtonIconOnly</enum>
-          </property>
-          <property name="autoRaise">
-           <bool>true</bool>
-          </property>
-          <property name="checkable">
-           <bool>true</bool>
-          </property>
-          <property name="checked">
-           <bool>true</bool>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="qSlicerMarkupsPlaceWidget" name="clipPointsMarkupsPlaceWidget"/>
-        </item>
-        <item>
-         <widget class="QPushButton" name="detectClipPointsButton">
-          <property name="toolTip">
-           <string>Replace the clip points above with one point per centerline terminus (the inlet and every branch outlet), each pulled inward from the vessel surface so the clip plane is positioned correctly without manual dragging.</string>
-          </property>
-          <property name="text">
-           <string>Detect from centerline</string>
-          </property>
-         </widget>
-        </item>
-       </layout>
       </item>
       <item row="2" column="0">
        <widget class="QLabel" name="label1">
@@ -173,7 +133,7 @@
           </property>
           <property name="nodeTypes">
            <stringlist>
-            <string>vtkMRMLModelNode</string>
+            <string notr="true">vtkMRMLModelNode</string>
            </stringlist>
           </property>
           <property name="showChildNodeTypes">
@@ -201,11 +161,71 @@
           <property name="toolTip">
            <string>Show or hide the centerlines</string>
           </property>
+          <property name="checkable">
+           <bool>true</bool>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
           <property name="toolButtonStyle">
            <enum>Qt::ToolButtonIconOnly</enum>
           </property>
           <property name="autoRaise">
            <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item row="3" column="0">
+       <widget class="QLabel" name="label_9">
+        <property name="text">
+         <string>Clip points:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1">
+       <layout class="QGridLayout" name="gridLayout">
+        <item row="0" column="0" colspan="2">
+         <widget class="qMRMLNodeComboBox" name="clipPointsMarkupsSelector">
+          <property name="toolTip">
+           <string>Branch clippoints. The first point is interpreted as the model inlet.</string>
+          </property>
+          <property name="nodeTypes">
+           <stringlist>
+            <string notr="true">vtkMRMLMarkupsFiducialNode</string>
+           </stringlist>
+          </property>
+          <property name="showChildNodeTypes">
+           <bool>false</bool>
+          </property>
+          <property name="baseName">
+           <string>Clip points</string>
+          </property>
+          <property name="noneEnabled">
+           <bool>true</bool>
+          </property>
+          <property name="addEnabled">
+           <bool>true</bool>
+          </property>
+          <property name="removeEnabled">
+           <bool>true</bool>
+          </property>
+          <property name="editEnabled">
+           <bool>true</bool>
+          </property>
+          <property name="renameEnabled">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item row="0" column="2">
+         <widget class="QToolButton" name="toggleClipPointsVisibilityButton">
+          <property name="enabled">
+           <bool>false</bool>
+          </property>
+          <property name="toolTip">
+           <string>Show or hide the clip points</string>
           </property>
           <property name="checkable">
            <bool>true</bool>
@@ -213,62 +233,53 @@
           <property name="checked">
            <bool>true</bool>
           </property>
+          <property name="toolButtonStyle">
+           <enum>Qt::ToolButtonIconOnly</enum>
+          </property>
+          <property name="autoRaise">
+           <bool>true</bool>
+          </property>
          </widget>
         </item>
+        <item row="1" column="0">
+         <widget class="QPushButton" name="detectClipPointsButton">
+          <property name="toolTip">
+           <string>Replace the clip points above with one point per centerline terminus (the inlet and every branch outlet), each pulled inward from the vessel surface so the clip plane is positioned correctly without manual dragging.</string>
+          </property>
+          <property name="text">
+           <string>Auto-detect from centerline</string>
+          </property>
+         </widget>
+        </item>
+        <item row="2" column="0">
+         <widget class="QLabel" name="clipPlaneInstructionsLabel">
+          <property name="text">
+           <string>Click point to adjust clip plane.</string>
+          </property>
+          <property name="wordWrap">
+           <bool>false</bool>
+          </property>
+         </widget>
+        </item>
+        <item row="2" column="1">
+         <widget class="QPushButton" name="finishPlaneEditingButton">
+          <property name="enabled">
+           <bool>false</bool>
+          </property>
+          <property name="text">
+           <string>Finish plane editing</string>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="1">
+         <widget class="qSlicerMarkupsPlaceWidget" name="clipPointsMarkupsPlaceWidget"/>
+        </item>
        </layout>
-      </item>
-      <item row="1" column="1">
-       <widget class="qMRMLSegmentSelectorWidget" name="inputSegmentSelectorWidget">
-        <property name="segmentationNodeSelectorVisible">
-         <bool>false</bool>
-        </property>
-       </widget>
       </item>
      </layout>
     </widget>
    </item>
-   <item row="0" column="0">
-    <widget class="QLabel" name="parameterSetLabel">
-     <property name="text">
-      <string>Paremeter set: </string>
-     </property>
-    </widget>
-   </item>
-   <item row="0" column="1">
-    <widget class="qMRMLNodeComboBox" name="parameterNodeSelector">
-     <property name="toolTip">
-      <string>Pick node to store parameter set</string>
-     </property>
-     <property name="nodeTypes">
-      <stringlist>
-       <string>vtkMRMLScriptedModuleNode</string>
-      </stringlist>
-     </property>
-     <property name="showHidden">
-      <bool>true</bool>
-     </property>
-     <property name="baseName">
-      <string>ClipVessel</string>
-     </property>
-     <property name="renameEnabled">
-      <bool>true</bool>
-     </property>
-    </widget>
-   </item>
-   <item row="10" column="0">
-    <spacer name="verticalSpacer">
-     <property name="orientation">
-      <enum>Qt::Vertical</enum>
-     </property>
-     <property name="sizeHint" stdset="0">
-      <size>
-       <width>20</width>
-       <height>40</height>
-      </size>
-     </property>
-    </spacer>
-   </item>
-   <item row="2" column="0" colspan="2">
+   <item>
     <widget class="ctkCollapsibleButton" name="outputsCollapsibleButton">
      <property name="text">
       <string>Outputs</string>
@@ -281,22 +292,22 @@
         </property>
        </widget>
       </item>
-      <item row="0" column="1" colspan="2">
+      <item row="0" column="0" colspan="2">
        <layout class="QHBoxLayout" name="outputSurfaceRowLayout">
         <item>
          <widget class="qMRMLNodeComboBox" name="outputSurfaceModelSelector">
-         <property name="toolTip">
-          <string>Result of clipping input model</string>
-         </property>
           <property name="maximumSize">
            <size>
             <width>360</width>
             <height>16777215</height>
            </size>
           </property>
+          <property name="toolTip">
+           <string>Result of clipping input model</string>
+          </property>
           <property name="nodeTypes">
            <stringlist>
-            <string>vtkMRMLModelNode</string>
+            <string notr="true">vtkMRMLModelNode</string>
            </stringlist>
           </property>
           <property name="showChildNodeTypes">
@@ -333,16 +344,16 @@
           <property name="text">
            <string/>
           </property>
-          <property name="toolButtonStyle">
-           <enum>Qt::ToolButtonIconOnly</enum>
-          </property>
-          <property name="autoRaise">
-           <bool>true</bool>
-          </property>
           <property name="checkable">
            <bool>true</bool>
           </property>
           <property name="checked">
+           <bool>true</bool>
+          </property>
+          <property name="toolButtonStyle">
+           <enum>Qt::ToolButtonIconOnly</enum>
+          </property>
+          <property name="autoRaise">
            <bool>true</bool>
           </property>
          </widget>
@@ -358,14 +369,14 @@
           <property name="text">
            <string>Edges</string>
           </property>
-          <property name="autoRaise">
-           <bool>true</bool>
-          </property>
           <property name="checkable">
            <bool>true</bool>
           </property>
           <property name="checked">
            <bool>false</bool>
+          </property>
+          <property name="autoRaise">
+           <bool>true</bool>
           </property>
          </widget>
         </item>
@@ -391,176 +402,14 @@
         </property>
        </widget>
       </item>
-     </layout>
-    </widget>
-   </item>
-   <item row="3" column="0" colspan="2">
-    <widget class="ctkCollapsibleButton" name="advancedCollapsibleButton">
-     <property name="text">
-      <string>Advanced</string>
-     </property>
-     <property name="collapsed">
-      <bool>true</bool>
-     </property>
-     <layout class="QFormLayout" name="formLayout_3">
-      <item row="0" column="0">
-       <widget class="QLabel" name="label_4">
-        <property name="text">
-         <string>Preprocess input surface:</string>
-        </property>
-       </widget>
-      </item>
-      <item row="0" column="1">
-       <widget class="QCheckBox" name="preprocessInputSurfaceModelCheckBox">
-        <property name="toolTip">
-         <string>Input surface model is reduced to the requested target point count (making computation faster), or subdivided (to make computations more accurate).</string>
-        </property>
-        <property name="text">
-         <string/>
-        </property>
-        <property name="checked">
-         <bool>false</bool>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="0">
-       <widget class="QLabel" name="label_3">
-        <property name="text">
-         <string>Target point count:</string>
-        </property>
-        <property name="indent">
-         <number>10</number>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="1">
-       <widget class="ctkSliderWidget" name="targetKPointCountWidget">
-        <property name="toolTip">
-         <string>Preferred number of points in the preprocessed surface.</string>
-        </property>
-        <property name="decimals">
-         <number>1</number>
-        </property>
-        <property name="singleStep">
-         <double>0.100000000000000</double>
-        </property>
-        <property name="minimum">
-         <double>0.100000000000000</double>
-        </property>
-        <property name="maximum">
-         <double>300.000000000000000</double>
-        </property>
-        <property name="value">
-         <double>50.000000000000000</double>
-        </property>
-        <property name="suffix">
-         <string>k</string>
-        </property>
-       </widget>
-      </item>
       <item row="2" column="0">
-       <widget class="QLabel" name="label_5">
+       <widget class="QLabel" name="label_13">
         <property name="text">
-         <string>Decimation aggressiveness:</string>
-        </property>
-        <property name="indent">
-         <number>10</number>
+         <string>Add flow extensions:</string>
         </property>
        </widget>
       </item>
       <item row="2" column="1">
-       <widget class="ctkSliderWidget" name="decimationAggressivenessWidget">
-        <property name="toolTip">
-         <string>Lower values preserve the mesh integrity better but it may not be possible to reduce number of points to the desired level.</string>
-        </property>
-        <property name="decimals">
-         <number>2</number>
-        </property>
-        <property name="singleStep">
-         <double>0.100000000000000</double>
-        </property>
-        <property name="minimum">
-         <double>0.000000000000000</double>
-        </property>
-        <property name="maximum">
-         <double>15.000000000000000</double>
-        </property>
-        <property name="value">
-         <double>4.000000000000000</double>
-        </property>
-       </widget>
-      </item>
-      <item row="3" column="0">
-       <widget class="QLabel" name="label_6">
-        <property name="text">
-         <string>Subdivide:</string>
-        </property>
-        <property name="indent">
-         <number>10</number>
-        </property>
-       </widget>
-      </item>
-      <item row="3" column="1">
-       <widget class="QCheckBox" name="subdivideInputSurfaceModelCheckBox">
-        <property name="toolTip">
-         <string>Subdivide the mesh to make computation more accurate (at the cost of increased computation time).</string>
-        </property>
-        <property name="text">
-         <string/>
-        </property>
-       </widget>
-      </item>
-      <item row="4" column="0">
-       <widget class="QLabel" name="label_8">
-        <property name="text">
-         <string>Output preprocessed surface:</string>
-        </property>
-        <property name="indent">
-         <number>10</number>
-        </property>
-       </widget>
-      </item>
-      <item row="4" column="1">
-       <widget class="qMRMLNodeComboBox" name="outputPreprocessedSurfaceModelSelector">
-        <property name="toolTip">
-         <string>Save preprocessing result. Useful for quality checks and for making repeated computations faster: preprocessed surface can be used as input surface (and &quot;Preprocess input surface&quot; option can then be disabled).</string>
-        </property>
-        <property name="nodeTypes">
-         <stringlist>
-          <string>vtkMRMLModelNode</string>
-         </stringlist>
-        </property>
-        <property name="showChildNodeTypes">
-         <bool>false</bool>
-        </property>
-        <property name="baseName">
-         <string>Preprocessed model</string>
-        </property>
-        <property name="noneEnabled">
-         <bool>true</bool>
-        </property>
-        <property name="addEnabled">
-         <bool>true</bool>
-        </property>
-        <property name="removeEnabled">
-         <bool>true</bool>
-        </property>
-        <property name="editEnabled">
-         <bool>true</bool>
-        </property>
-        <property name="renameEnabled">
-         <bool>true</bool>
-        </property>
-       </widget>
-      </item>
-      <item row="5" column="0">
-       <widget class="QLabel" name="label_11">
-        <property name="text">
-         <string>Add Flow Extensions:</string>
-        </property>
-       </widget>
-      </item>
-      <item row="5" column="1">
        <widget class="QCheckBox" name="addFlowExtensionsCheckBox">
         <property name="toolTip">
          <string>Check if flow extensions are desired.</string>
@@ -570,6 +419,149 @@
         </property>
         <property name="checked">
          <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="ctkCollapsibleButton" name="advancedCollapsibleButton">
+     <property name="text">
+      <string>Advanced</string>
+     </property>
+     <property name="collapsed">
+      <bool>true</bool>
+     </property>
+     <layout class="QFormLayout" name="formLayout_3">
+      <item row="0" column="0">
+       <widget class="QLabel" name="clippingMethodLabel">
+        <property name="text">
+         <string>Clipping method:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QComboBox" name="clippingMethodComboBox">
+        <property name="toolTip">
+         <string>Plane cuts with an infinite plane (other branches the plane crosses are preserved by connectivity). Plane + sphere cuts with the intersection of the plane and a sphere around the clip point; this confines the cut but may leave a seam ring where the sphere crosses the vessel wall. Plane + patch confines the plane cut to the surface cells near the clip point without creating any seam. Box cuts with an open box whose base face lies in the cut plane; the cut is planar, but the box sides may leave seams if they touch other parts of the surface.</string>
+        </property>
+        <property name="editable">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="localSphereRadiusFactorLabel">
+        <property name="text">
+         <string>Local sphere radius:</string>
+        </property>
+        <property name="indent">
+         <number>10</number>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="ctkSliderWidget" name="localSphereRadiusFactorWidget">
+        <property name="toolTip">
+         <string>Size of the local region (sphere/patch radius or box half-width) as a multiple of the vessel radius at each clip point.</string>
+        </property>
+        <property name="decimals">
+         <number>1</number>
+        </property>
+        <property name="singleStep">
+         <double>0.100000000000000</double>
+        </property>
+        <property name="minimum">
+         <double>0.500000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>10.000000000000000</double>
+        </property>
+        <property name="value">
+         <double>2.500000000000000</double>
+        </property>
+        <property name="suffix">
+         <string notr="true"> x</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="clipPointInsetLabel">
+        <property name="text">
+         <string>Clip point auto-detect inset:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="ctkSliderWidget" name="clipPointInsetFactorWidget">
+        <property name="toolTip">
+         <string>When detecting clip points, move each point inward from the centerline terminus by this multiple of the local vessel radius.</string>
+        </property>
+        <property name="decimals">
+         <number>2</number>
+        </property>
+        <property name="singleStep">
+         <double>0.050000000000000</double>
+        </property>
+        <property name="minimum">
+         <double>0.000000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>10.000000000000000</double>
+        </property>
+        <property name="value">
+         <double>0.500000000000000</double>
+        </property>
+        <property name="suffix">
+         <string notr="true"> x</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="0">
+       <widget class="QLabel" name="label_12">
+        <property name="text">
+         <string>Snap clip points to centerline:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1">
+       <widget class="QCheckBox" name="snapClipPointsToCenterlineCheckBox">
+        <property name="toolTip">
+         <string>While dragging a clip point, snap it onto the centerline model. When unchecked, clip points snap to the visible surface model instead.</string>
+        </property>
+        <property name="text">
+         <string/>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="0">
+       <widget class="QLabel" name="freeNormalHandleLabel">
+        <property name="text">
+         <string>Free plane normal handle:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="1">
+       <widget class="QCheckBox" name="freeNormalHandleCheckBox">
+        <property name="toolTip">
+         <string>Use the free plane normal handle instead of Slicer's standard orthogonal translation and rotation handles.</string>
+        </property>
+        <property name="text">
+         <string/>
+        </property>
+        <property name="checked">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="5" column="0">
+       <widget class="QLabel" name="label_11">
+        <property name="text">
+         <string>Flow Extensions:</string>
         </property>
        </widget>
       </item>
@@ -604,139 +596,38 @@
          <double>5.000000000000000</double>
         </property>
        </widget>
-      </item>  
-	  <item row="7" column="0">
-	   <widget class="QLabel" name="label_3">
-		<property name="text">
-		 <string>Extension mode</string>
-		</property>
-		<property name="indent">
-		 <number>12</number>
-		</property>
-	   </widget>
-	  </item>
-		  <item row="7" column="1" colspan="3">
-	   <widget class="QComboBox" name="extensionModeComboBox">
-		<property name="toolTip">
-		 <string>Mode for adding flow extension</string>
-		</property>
-		<property name="editable">
-		 <bool>false</bool>
-		</property>
-		   </widget>
-		  </item>
-      <item row="8" column="0">
-       <widget class="QLabel" name="clipPointInsetLabel">
+      </item>
+      <item row="7" column="0">
+       <widget class="QLabel" name="label_3">
         <property name="text">
-         <string>Clip point inset:</string>
+         <string>Extension mode</string>
+        </property>
+        <property name="indent">
+         <number>12</number>
         </property>
        </widget>
       </item>
-      <item row="8" column="1">
-       <widget class="ctkSliderWidget" name="clipPointInsetFactorWidget">
+      <item row="7" column="1">
+       <widget class="QComboBox" name="extensionModeComboBox">
         <property name="toolTip">
-         <string>When detecting clip points, move each point inward from the centerline terminus by this multiple of the local vessel radius.</string>
-        </property>
-        <property name="decimals">
-         <number>2</number>
-        </property>
-        <property name="singleStep">
-         <double>0.050000000000000</double>
-        </property>
-        <property name="minimum">
-         <double>0.000000000000000</double>
-        </property>
-        <property name="maximum">
-         <double>10.000000000000000</double>
-        </property>
-        <property name="value">
-         <double>0.500000000000000</double>
-        </property>
-        <property name="suffix">
-         <string> x</string>
-        </property>
-       </widget>
-      </item>
-      <item row="9" column="0">
-       <widget class="QLabel" name="label_12">
-        <property name="text">
-         <string>Snap clip points to centerline:</string>
-        </property>
-       </widget>
-      </item>
-      <item row="9" column="1">
-       <widget class="QCheckBox" name="snapClipPointsToCenterlineCheckBox">
-        <property name="toolTip">
-         <string>While dragging a clip point, snap it onto the centerline model. When unchecked, clip points snap to the visible surface model instead.</string>
-        </property>
-        <property name="text">
-         <string/>
-        </property>
-        <property name="checked">
-         <bool>true</bool>
-        </property>
-       </widget>
-      </item>
-      <item row="10" column="0">
-       <widget class="QLabel" name="clippingMethodLabel">
-        <property name="text">
-         <string>Clipping method:</string>
-        </property>
-       </widget>
-      </item>
-      <item row="10" column="1">
-       <widget class="QComboBox" name="clippingMethodComboBox">
-        <property name="toolTip">
-         <string>Plane cuts with an infinite plane (other branches the plane crosses are preserved by connectivity). Plane + local sphere cuts with the intersection of the plane and a sphere around the clip point; this confines the cut but may leave a seam ring where the sphere crosses the vessel wall. Plane + local patch confines the plane cut to the surface cells near the clip point without creating any seam. Plane + local box cuts with an open box whose base face lies in the cut plane; the cut is planar, but the box sides may leave seams if they touch other parts of the surface.</string>
+         <string>Mode for adding flow extension</string>
         </property>
         <property name="editable">
          <bool>false</bool>
         </property>
        </widget>
       </item>
-      <item row="11" column="0">
-       <widget class="QLabel" name="localSphereRadiusFactorLabel">
+      <item row="8" column="0">
+       <widget class="QLabel" name="label_4">
         <property name="text">
-         <string>Local sphere radius:</string>
+         <string>Preprocess input surface:</string>
         </property>
        </widget>
       </item>
-      <item row="11" column="1">
-       <widget class="ctkSliderWidget" name="localSphereRadiusFactorWidget">
+      <item row="8" column="1">
+       <widget class="QCheckBox" name="preprocessInputSurfaceModelCheckBox">
         <property name="toolTip">
-         <string>Size of the local region (sphere/patch radius or box half-width) as a multiple of the vessel radius at each clip point.</string>
-        </property>
-        <property name="decimals">
-         <number>1</number>
-        </property>
-        <property name="singleStep">
-         <double>0.1</double>
-        </property>
-        <property name="minimum">
-         <double>0.5</double>
-        </property>
-        <property name="maximum">
-         <double>10.0</double>
-        </property>
-        <property name="value">
-         <double>2.5</double>
-        </property>
-        <property name="suffix">
-         <string> x</string>
-        </property>
-       </widget>
-      </item>
-      <item row="12" column="0">
-       <widget class="QLabel" name="freeNormalHandleLabel">
-        <property name="text">
-         <string>Free plane normal handle:</string>
-        </property>
-       </widget>
-      </item>
-      <item row="12" column="1">
-       <widget class="QCheckBox" name="freeNormalHandleCheckBox">
-        <property name="toolTip">
-         <string>Use the free plane normal handle instead of Slicer's standard orthogonal translation and rotation handles.</string>
+         <string>Input surface model is reduced to the requested target point count (making computation faster), or subdivided (to make computations more accurate).</string>
         </property>
         <property name="text">
          <string/>
@@ -746,20 +637,140 @@
         </property>
        </widget>
       </item>
+      <item row="9" column="0">
+       <widget class="QLabel" name="label_3">
+        <property name="text">
+         <string>Target point count:</string>
+        </property>
+        <property name="indent">
+         <number>10</number>
+        </property>
+       </widget>
+      </item>
+      <item row="9" column="1">
+       <widget class="ctkSliderWidget" name="targetKPointCountWidget">
+        <property name="toolTip">
+         <string>Preferred number of points in the preprocessed surface.</string>
+        </property>
+        <property name="decimals">
+         <number>1</number>
+        </property>
+        <property name="singleStep">
+         <double>0.100000000000000</double>
+        </property>
+        <property name="minimum">
+         <double>0.100000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>300.000000000000000</double>
+        </property>
+        <property name="value">
+         <double>50.000000000000000</double>
+        </property>
+        <property name="suffix">
+         <string notr="true">k</string>
+        </property>
+       </widget>
+      </item>
+      <item row="10" column="0">
+       <widget class="QLabel" name="label_5">
+        <property name="text">
+         <string>Decimation aggressiveness:</string>
+        </property>
+        <property name="indent">
+         <number>10</number>
+        </property>
+       </widget>
+      </item>
+      <item row="10" column="1">
+       <widget class="ctkSliderWidget" name="decimationAggressivenessWidget">
+        <property name="toolTip">
+         <string>Lower values preserve the mesh integrity better but it may not be possible to reduce number of points to the desired level.</string>
+        </property>
+        <property name="decimals">
+         <number>2</number>
+        </property>
+        <property name="singleStep">
+         <double>0.100000000000000</double>
+        </property>
+        <property name="minimum">
+         <double>0.000000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>15.000000000000000</double>
+        </property>
+        <property name="value">
+         <double>4.000000000000000</double>
+        </property>
+       </widget>
+      </item>
+      <item row="11" column="0">
+       <widget class="QLabel" name="label_6">
+        <property name="text">
+         <string>Subdivide:</string>
+        </property>
+        <property name="indent">
+         <number>10</number>
+        </property>
+       </widget>
+      </item>
+      <item row="11" column="1">
+       <widget class="QCheckBox" name="subdivideInputSurfaceModelCheckBox">
+        <property name="toolTip">
+         <string>Subdivide the mesh to make computation more accurate (at the cost of increased computation time).</string>
+        </property>
+        <property name="text">
+         <string/>
+        </property>
+       </widget>
+      </item>
+      <item row="12" column="0">
+       <widget class="QLabel" name="label_8">
+        <property name="text">
+         <string>Output preprocessed surface:</string>
+        </property>
+        <property name="indent">
+         <number>10</number>
+        </property>
+       </widget>
+      </item>
+      <item row="12" column="1">
+       <widget class="qMRMLNodeComboBox" name="outputPreprocessedSurfaceModelSelector">
+        <property name="toolTip">
+         <string>Save preprocessing result. Useful for quality checks and for making repeated computations faster: preprocessed surface can be used as input surface (and &quot;Preprocess input surface&quot; option can then be disabled).</string>
+        </property>
+        <property name="nodeTypes">
+         <stringlist>
+          <string notr="true">vtkMRMLModelNode</string>
+         </stringlist>
+        </property>
+        <property name="showChildNodeTypes">
+         <bool>false</bool>
+        </property>
+        <property name="baseName">
+         <string>Preprocessed model</string>
+        </property>
+        <property name="noneEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="addEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="removeEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="editEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="renameEnabled">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
      </layout>
     </widget>
    </item>
-   <item row="4" column="0" colspan="2">
-    <widget class="QLabel" name="clipPlaneInstructionsLabel">
-     <property name="text">
-      <string>Click a clip point to show and adjust its clip plane.</string>
-     </property>
-     <property name="wordWrap">
-      <bool>true</bool>
-     </property>
-    </widget>
-   </item>
-   <item row="5" column="0" colspan="2">
+   <item>
     <widget class="ctkCheckablePushButton" name="applyButton">
      <property name="toolTip">
       <string>Apply the clipping once. Check the button to automatically apply when parameters or planes change.</string>
@@ -778,17 +789,7 @@
      </property>
     </widget>
    </item>
-   <item row="6" column="0" colspan="2">
-    <widget class="QPushButton" name="finishPlaneEditingButton">
-     <property name="enabled">
-      <bool>false</bool>
-     </property>
-     <property name="text">
-      <string>Finish plane editing</string>
-     </property>
-    </widget>
-   </item>
-   <item row="8" column="0" colspan="2">
+   <item>
     <widget class="QLabel" name="clipStatusLabel">
      <property name="text">
       <string/>
@@ -798,50 +799,26 @@
      </property>
     </widget>
    </item>
+   <item>
+    <spacer name="verticalSpacer">
+     <property name="orientation">
+      <enum>Qt::Vertical</enum>
+     </property>
+     <property name="sizeHint" stdset="0">
+      <size>
+       <width>20</width>
+       <height>40</height>
+      </size>
+     </property>
+    </spacer>
+   </item>
   </layout>
  </widget>
  <customwidgets>
   <customwidget>
-   <class>ctkCheckablePushButton</class>
-   <extends>QPushButton</extends>
-   <header>ctkCheckablePushButton.h</header>
-  </customwidget>
-  <customwidget>
-   <class>ctkCollapsibleButton</class>
-   <extends>QWidget</extends>
-   <header>ctkCollapsibleButton.h</header>
-   <container>1</container>
-  </customwidget>
-  <customwidget>
-   <class>ctkCollapsibleGroupBox</class>
-   <extends>QGroupBox</extends>
-   <header>ctkCollapsibleGroupBox.h</header>
-   <container>1</container>
-  </customwidget>
-  <customwidget>
-   <class>ctkDoubleSpinBox</class>
-   <extends>QWidget</extends>
-   <header>ctkDoubleSpinBox.h</header>
-  </customwidget>
-  <customwidget>
-   <class>ctkPushButton</class>
-   <extends>QPushButton</extends>
-   <header>ctkPushButton.h</header>
-  </customwidget>
-  <customwidget>
-   <class>ctkSliderWidget</class>
-   <extends>QWidget</extends>
-   <header>ctkSliderWidget.h</header>
-  </customwidget>
-  <customwidget>
    <class>qMRMLNodeComboBox</class>
    <extends>QWidget</extends>
    <header>qMRMLNodeComboBox.h</header>
-  </customwidget>
-  <customwidget>
-   <class>qMRMLSpinBox</class>
-   <extends>ctkDoubleSpinBox</extends>
-   <header>qMRMLSpinBox.h</header>
   </customwidget>
   <customwidget>
    <class>qMRMLWidget</class>
@@ -864,6 +841,27 @@
    <class>qMRMLSegmentSelectorWidget</class>
    <extends>qMRMLWidget</extends>
    <header>qMRMLSegmentSelectorWidget.h</header>
+  </customwidget>
+  <customwidget>
+   <class>ctkCheckablePushButton</class>
+   <extends>ctkPushButton</extends>
+   <header>ctkCheckablePushButton.h</header>
+  </customwidget>
+  <customwidget>
+   <class>ctkCollapsibleButton</class>
+   <extends>QWidget</extends>
+   <header>ctkCollapsibleButton.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>ctkPushButton</class>
+   <extends>QPushButton</extends>
+   <header>ctkPushButton.h</header>
+  </customwidget>
+  <customwidget>
+   <class>ctkSliderWidget</class>
+   <extends>QWidget</extends>
+   <header>ctkSliderWidget.h</header>
   </customwidget>
  </customwidgets>
  <resources/>
@@ -915,7 +913,7 @@
      <y>18</y>
     </hint>
    </hints>
-  </connection>  
+  </connection>
   <connection>
    <sender>ClipVessel</sender>
    <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
@@ -968,38 +966,6 @@
    <sender>ClipVessel</sender>
    <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
    <receiver>outputPreprocessedSurfaceModelSelector</receiver>
-   <slot>setMRMLScene(vtkMRMLScene*)</slot>
-   <hints>
-    <hint type="sourcelabel">
-     <x>162</x>
-     <y>597</y>
-    </hint>
-    <hint type="destinationlabel">
-     <x>403</x>
-     <y>487</y>
-    </hint>
-   </hints>
-  </connection>
-  <connection>
-   <sender>ClipVessel</sender>
-   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
-   <receiver>outputClipMarkupsSelector</receiver>
-   <slot>setMRMLScene(vtkMRMLScene*)</slot>
-   <hints>
-    <hint type="sourcelabel">
-     <x>162</x>
-     <y>597</y>
-    </hint>
-    <hint type="destinationlabel">
-     <x>403</x>
-     <y>487</y>
-    </hint>
-   </hints>
-  </connection>
-  <connection>
-   <sender>Outputs</sender>
-   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
-   <receiver>capOutputSurfaceModelCheckBox</receiver>
    <slot>setMRMLScene(vtkMRMLScene*)</slot>
    <hints>
     <hint type="sourcelabel">
@@ -1121,38 +1087,6 @@
     <hint type="destinationlabel">
      <x>137</x>
      <y>100</y>
-    </hint>
-   </hints>
-  </connection>
-  <connection>
-   <sender>addFlowExtensionsCheckBox</sender>
-   <signal>toggled(bool)</signal>
-   <receiver>extensionLengthWidget</receiver>
-   <slot>setEnabled(bool)</slot>
-   <hints>
-    <hint type="sourcelabel">
-     <x>403</x>
-     <y>405</y>
-    </hint>
-    <hint type="destinationlabel">
-     <x>403</x>
-     <y>447</y>
-    </hint>
-   </hints>
-  </connection>
-  <connection>
-   <sender>addFlowExtensionsCheckBox</sender>
-   <signal>toggled(bool)</signal>
-   <receiver>extensionModeComboBox</receiver>
-   <slot>setEnabled(bool)</slot>
-   <hints>
-    <hint type="sourcelabel">
-     <x>162</x>
-     <y>597</y>
-    </hint>
-    <hint type="destinationlabel">
-     <x>403</x>
-     <y>487</y>
     </hint>
    </hints>
   </connection>
