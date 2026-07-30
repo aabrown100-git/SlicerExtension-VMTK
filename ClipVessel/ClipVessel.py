@@ -173,6 +173,12 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     Called when the application closes and the module widget is destroyed.
     """
     self.removeObservers()
+    # removeObservers() dropped every observation already; clear the trackers so that any
+    # signal still arriving during teardown does not attempt a second removal (which would
+    # emit a "does not have observer" warning).
+    self._observedClipPointsNode = None
+    self._observedInteractivePlaneNode = None
+    self._observedNormalHandleNode = None
     if self.autoApplyTimer:
         self.autoApplyTimer.stop()
 
@@ -232,6 +238,10 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         return
 
     self.updatingGUIFromParameterNode = True
+
+    # A parameter node restored from an older scene, or re-created after a scene clear, may
+    # be missing some parameters; fill in defaults so that the value reads below never fail.
+    self.logic.setDefaultParameters(self._parameterNode)
 
     # Update each widget from parameter node
     # Need to temporarily block signals to prevent infinite recursion (MRML node update triggers
@@ -335,35 +345,56 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     The changes are saved into the parameter node (so that they are restored when the scene is saved and loaded).
     """
 
-    if self._parameterNode is None:
+    if self._parameterNode is None or self.updatingGUIFromParameterNode:
+        # The updatingGUIFromParameterNode guard is essential: while updateGUIFromParameterNode
+        # synchronizes the widgets (e.g. when switching between parameter set nodes), the node
+        # selectors fire currentNodeChanged one by one, and writing the still-stale widget
+        # states back here would wipe the node references of the newly selected parameter node
+        # (leaving the Apply button disabled, among other data loss).
         return
 
+    # Hold a local reference: reentrant signals (e.g. the parameter node selector switching
+    # or the scene closing) can set self._parameterNode to None while this method runs.
+    parameterNode = self._parameterNode
+
     for nodeSelector, roleName in self.nodeSelectors:
-        self._parameterNode.SetNodeReferenceID(roleName, nodeSelector.currentNodeID)
+        parameterNode.SetNodeReferenceID(roleName, nodeSelector.currentNodeID)
 
-    inputSurfaceNode = self._parameterNode.GetNodeReference("InputSurface")
+    inputSurfaceNode = parameterNode.GetNodeReference("InputSurface")
     if inputSurfaceNode and inputSurfaceNode.IsA("vtkMRMLSegmentationNode"):
-        self._parameterNode.SetParameter("InputSegmentID", self.ui.inputSegmentSelectorWidget.currentSegmentID())
+        parameterNode.SetParameter("InputSegmentID", self.ui.inputSegmentSelectorWidget.currentSegmentID())
 
-    self.ui.inputSegmentSelectorWidget.setCurrentSegmentID(self._parameterNode.GetParameter("InputSegmentID"))
+    self.ui.inputSegmentSelectorWidget.setCurrentSegmentID(parameterNode.GetParameter("InputSegmentID"))
     self.ui.inputSegmentSelectorWidget.setVisible(inputSurfaceNode and inputSurfaceNode.IsA("vtkMRMLSegmentationNode"))
 
-    wasModify = self._parameterNode.StartModify()
-    self._parameterNode.SetParameter("TargetNumberOfPoints", str(self.ui.targetKPointCountWidget.value*1000.0))
-    self._parameterNode.SetParameter("DecimationAggressiveness", str(self.ui.decimationAggressivenessWidget.value))
-    self._parameterNode.SetParameter("PreprocessInputSurface", "true" if self.ui.preprocessInputSurfaceModelCheckBox.checked else "false")
-    self._parameterNode.SetParameter("SubdivideInputSurface", "true" if self.ui.subdivideInputSurfaceModelCheckBox.checked else "false")
-    self._parameterNode.SetParameter("CapOutputSurface", "true" if self.ui.capOutputSurfaceModelCheckBox.checked else "false")
-    self._parameterNode.SetParameter("ExtendOutputSurface", "true" if self.ui.addFlowExtensionsCheckBox.checked else "false")
-    self._parameterNode.SetParameter("ExtensionLength", str(self.ui.extensionLengthWidget.value))
-    self._parameterNode.SetParameter("ExtensionMode", self.ui.extensionModeComboBox.currentData)
-    self._parameterNode.SetParameter("AutoApplyPlane", "true" if self.ui.applyButton.checked else "false")
-    self._parameterNode.SetParameter("ClipPointInsetFactor", str(self.ui.clipPointInsetFactorWidget.value))
-    self._parameterNode.SetParameter("SnapClipPointsToCenterline", "true" if self.ui.snapClipPointsToCenterlineCheckBox.checked else "false")
-    self._parameterNode.SetParameter("ClippingMethod", self.ui.clippingMethodComboBox.currentData)
-    self._parameterNode.SetParameter("LocalSphereRadiusFactor", str(self.ui.localSphereRadiusFactorWidget.value))
-    self._parameterNode.SetParameter("FreeNormalHandle", "true" if self.ui.freeNormalHandleCheckBox.checked else "false")
-    self._parameterNode.EndModify(wasModify)
+    wasModify = parameterNode.StartModify()
+    parameterNode.SetParameter("TargetNumberOfPoints", str(self.ui.targetKPointCountWidget.value*1000.0))
+    parameterNode.SetParameter("DecimationAggressiveness", str(self.ui.decimationAggressivenessWidget.value))
+    parameterNode.SetParameter("PreprocessInputSurface", "true" if self.ui.preprocessInputSurfaceModelCheckBox.checked else "false")
+    parameterNode.SetParameter("SubdivideInputSurface", "true" if self.ui.subdivideInputSurfaceModelCheckBox.checked else "false")
+    parameterNode.SetParameter("CapOutputSurface", "true" if self.ui.capOutputSurfaceModelCheckBox.checked else "false")
+    parameterNode.SetParameter("ExtendOutputSurface", "true" if self.ui.addFlowExtensionsCheckBox.checked else "false")
+    parameterNode.SetParameter("ExtensionLength", str(self.ui.extensionLengthWidget.value))
+    # currentData is None while the combobox is still empty (during widget setup); skip the
+    # write instead of passing None to SetParameter.
+    extensionMode = self.ui.extensionModeComboBox.currentData
+    if extensionMode:
+        parameterNode.SetParameter("ExtensionMode", extensionMode)
+    parameterNode.SetParameter("AutoApplyPlane", "true" if self.ui.applyButton.checked else "false")
+    parameterNode.SetParameter("ClipPointInsetFactor", str(self.ui.clipPointInsetFactorWidget.value))
+    parameterNode.SetParameter("SnapClipPointsToCenterline", "true" if self.ui.snapClipPointsToCenterlineCheckBox.checked else "false")
+    clippingMethod = self.ui.clippingMethodComboBox.currentData
+    if clippingMethod:
+        parameterNode.SetParameter("ClippingMethod", clippingMethod)
+    parameterNode.SetParameter("LocalSphereRadiusFactor", str(self.ui.localSphereRadiusFactorWidget.value))
+    parameterNode.SetParameter("FreeNormalHandle", "true" if self.ui.freeNormalHandleCheckBox.checked else "false")
+    parameterNode.EndModify(wasModify)
+    # Changing a node reference (or re-writing an unchanged parameter value) does not emit a
+    # ModifiedEvent on the parameter node, so GUI state that depends on the references - the
+    # auto-created output node, the Apply button enabled state, etc. - would not refresh when
+    # only a node selector changed. Refresh explicitly; the updatingGUIFromParameterNode flag
+    # makes this recursion-safe.
+    self.updateGUIFromParameterNode()
     self.scheduleAutoApply()
 
   def observeClipPointsNode(self, clipPointsNode):
