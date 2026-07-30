@@ -1,8 +1,8 @@
-import os 
-import unittest
+import json
 import logging
-import vtk, qt, ctk, slicer
+import vtk, qt, slicer
 import numpy as np
+from vtk.util.numpy_support import vtk_to_numpy
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 import vtkvmtkComputationalGeometryPython as vtkvmtkComputationalGeometry
@@ -48,6 +48,20 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.logic = None
     self._parameterNode = None
     self.updatingGUIFromParameterNode = False
+    self._observedClipPointsNode = None
+    self._observedInteractivePlaneNode = None
+    self._observedNormalHandleNode = None
+    self._activeClipPointIndex = -1
+    self._updatingInteractivePlane = False
+    self._manualPlaneNormals = {}
+    self._manualPlaneOrigins = {}
+    self._normalHandleDistance = 1.0
+    self._planeEditing = False
+    self._preprocessedCacheKey = None
+    self._preprocessedPolyData = None
+    self._applying = False
+    self._clipPointDragStartPosition = None
+    self.autoApplyTimer = None
 
   def setup(self):
     """
@@ -68,9 +82,6 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         (self.ui.outputPreprocessedSurfaceModelSelector, "PreprocessedSurface"),
         ]
 
-    # Add vertical spacer
-    #self.layout.addStretch(1)
-
     # Set scene in MRML widgets. Make sure that in Qt designer
     # "mrmlSceneChanged(vtkMRMLScene*)" signal in is connected to each MRML widget's.
     # "setMRMLScene(vtkMRMLScene*)" slot.
@@ -78,6 +89,18 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     self.logic = ClipVesselLogic()
     self.ui.parameterNodeSelector.addAttribute("vtkMRMLScriptedModuleNode", "ModuleName", self.moduleName)
+
+    self.autoApplyTimer = qt.QTimer()
+    self.autoApplyTimer.setSingleShot(True)
+    self.autoApplyTimer.setInterval(60)
+    self.autoApplyTimer.connect("timeout()", self.onAutoApplyTimeout)
+
+    self.inputVisibilityButtons = [
+        (self.ui.toggleInputSurfaceVisibilityButton, "InputSurface", "input surface"),
+        (self.ui.toggleCenterlinesVisibilityButton, "InputCenterlines", "centerlines"),
+        (self.ui.toggleClipPointsVisibilityButton, "ClipPoints", "clip points"),
+    ]
+
     self.setParameterNode(self.logic.getParameterNode())
 
     # Connections
@@ -85,6 +108,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.addFlowExtensionsCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
     self.ui.parameterNodeSelector.connect('currentNodeChanged(vtkMRMLNode*)', self.setParameterNode)
     self.ui.applyButton.connect('clicked(bool)', self.onApplyButton)
+    self.ui.applyButton.connect('checkBoxToggled(bool)', self.updateParameterNodeFromGUI)
     self.ui.preprocessInputSurfaceModelCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
     self.ui.subdivideInputSurfaceModelCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
     self.ui.targetKPointCountWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
@@ -94,10 +118,31 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.extensionModeComboBox.addItems(["centerlinedirection", "boundarynormal", "linear", "thinplatespline"])
     self.ui.extensionModeComboBox.connect('currentIndexChanged(int)', self.updateParameterNodeFromGUI)
     self.ui.extensionModeComboBox.setCurrentIndex(1)
+    self.ui.clipPointInsetFactorWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
+    self.ui.clippingMethodComboBox.addItems(["Plane", "Plane + local sphere"])
+    self.ui.clippingMethodComboBox.connect('currentIndexChanged(int)', self.onClippingMethodChanged)
+    self.ui.localSphereRadiusFactorWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
+    self.ui.freeNormalHandleCheckBox.connect("toggled(bool)", self.onFreeNormalHandleToggled)
+    self.ui.detectClipPointsButton.connect('clicked(bool)', self.onDetectClipPointsButton)
+    self.ui.snapClipPointsToCenterlineCheckBox.connect("toggled(bool)", self.onSnapClipPointsToCenterlineToggled)
+    self.ui.toggleOutputVisibilityButton.connect("toggled(bool)", self.onToggleOutputVisibilityButton)
+    self.ui.toggleOutputEdgesButton.connect("toggled(bool)", self.onToggleOutputEdgesButton)
+    self.ui.finishPlaneEditingButton.connect("clicked(bool)", self.finishPlaneEditing)
+    self.ui.toggleOutputVisibilityButton.setIcon(qt.QIcon(':/Icons/Medium/SlicerVisibleInvisible.png'))
+    self.ui.toggleOutputVisibilityButton.setAutoRaise(True)
+    self.ui.toggleOutputEdgesButton.setAutoRaise(True)
+    for button, roleName, objectName in self.inputVisibilityButtons:
+        button.setIcon(qt.QIcon(':/Icons/Medium/SlicerVisibleInvisible.png'))
+        button.setAutoRaise(True)
+        button.connect("toggled(bool)",
+                       lambda checked, roleName=roleName, button=button, objectName=objectName:
+                       self.onToggleNodeVisibility(roleName, checked, button, objectName))
 
     for nodeSelector, roleName in self.nodeSelectors:
       nodeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
       
+    self.addObserver(slicer.mrmlScene, slicer.vtkMRMLScene.EndBatchProcessEvent,
+                     self.onSceneBatchProcessEnded)
     self.updateGUIFromParameterNode()
     
 
@@ -106,6 +151,8 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     Called when the application closes and the module widget is destroyed.
     """
     self.removeObservers()
+    if self.autoApplyTimer:
+        self.autoApplyTimer.stop()
 
   def setParameterNode(self, inputParameterNode):
     """
@@ -133,6 +180,13 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     if inputParameterNode is not None:
         self.addObserver(inputParameterNode, vtk.vtkCommand.ModifiedEvent, self.updateGUIFromParameterNode)
     self._parameterNode = inputParameterNode
+
+    self.observeClipPointsNode(inputParameterNode.GetNodeReference("ClipPoints") if inputParameterNode else None)
+    if inputParameterNode:
+        self._manualPlaneNormals = self.manualPlaneNormalsFromParameterNode()
+        self._manualPlaneOrigins = self.manualPlaneOriginsFromParameterNode()
+        self.observeInteractivePlaneNode(inputParameterNode.GetNodeReference("ManualClipPlane"))
+        self.observeNormalHandleNode(inputParameterNode.GetNodeReference("ManualClipPlaneNormalHandle"))
 
     # Initial GUI update
     self.updateGUIFromParameterNode()
@@ -164,11 +218,16 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         nodeSelector.setCurrentNode(self._parameterNode.GetNodeReference(roleName))
 
     inputSurfaceNode = self._parameterNode.GetNodeReference("InputSurface")
+    inputSurfaceName = inputSurfaceNode.GetName() if inputSurfaceNode else None
+    self.ui.outputSurfaceModelSelector.baseName = (
+        inputSurfaceName + " clipped" if inputSurfaceName else "Output surface model")
+    self.ensureOutputSurfaceNode(inputSurfaceNode)
     if inputSurfaceNode and inputSurfaceNode.IsA("vtkMRMLSegmentationNode"):
         self.ui.inputSegmentSelectorWidget.setCurrentSegmentID(self._parameterNode.GetParameter("InputSegmentID"))
         self.ui.inputSegmentSelectorWidget.setVisible(True)
     else:
         self.ui.inputSegmentSelectorWidget.setVisible(False)
+    self.updateInputSurfaceOpacity(inputSurfaceNode)
 
     #self.ui.inputCenterlinesSelector.setVisible(True)
 
@@ -185,6 +244,33 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.addFlowExtensionsCheckBox.checked = (self._parameterNode.GetParameter("ExtendOutputSurface") == "true")    
     self.ui.extensionLengthWidget.value = float(self._parameterNode.GetParameter("ExtensionLength"))
     self.ui.extensionModeComboBox.currentText = self._parameterNode.GetParameter("ExtensionMode")
+    autoApply = self._parameterNode.GetParameter("AutoApplyPlane") == "true"
+    self.ui.applyButton.checkable = autoApply
+    self.ui.applyButton.checked = autoApply
+    self.ui.clipPointInsetFactorWidget.value = float(self._parameterNode.GetParameter("ClipPointInsetFactor"))
+    self.ui.detectClipPointsButton.enabled = self._parameterNode.GetNodeReference("InputCenterlines") is not None
+    self.ui.snapClipPointsToCenterlineCheckBox.checked = (self._parameterNode.GetParameter("SnapClipPointsToCenterline") == "true")
+    clippingMethod = self._parameterNode.GetParameter("ClippingMethod") or "Plane"
+    self.ui.clippingMethodComboBox.currentText = clippingMethod
+    self.ui.localSphereRadiusFactorWidget.value = float(self._parameterNode.GetParameter("LocalSphereRadiusFactor"))
+    self.updateClippingMethodUI(clippingMethod)
+    self.ui.freeNormalHandleCheckBox.checked = (self._parameterNode.GetParameter("FreeNormalHandle") == "true")
+    self.updatePlaneHandleMode()
+    self.observeClipPointsNode(self._parameterNode.GetNodeReference("ClipPoints"))
+    self.updateClipPointsSnapMode()
+    self.updateOutputVisibilityButton()
+    self.updateOutputEdgesButton()
+    self.updateInputVisibilityButtons()
+
+    if self.logic.lastPlanarityFailures:
+        failedLabels = [result["label"] for result in self.logic.lastPlanarityFailures]
+        self.ui.clipStatusLabel.text = "Non-planar cuts: " + ", ".join(failedLabels)
+        self.ui.clipStatusLabel.styleSheet = "QLabel { color: #d08000; }"
+    elif self.logic.lastPlanarityResults:
+        self.ui.clipStatusLabel.text = "All cuts are planar."
+        self.ui.clipStatusLabel.styleSheet = "QLabel { color: #008000; }"
+    else:
+        self.ui.clipStatusLabel.text = "Click a clip point to show and adjust its clip plane."
     
     # Update buttons states and tooltips
     if self._parameterNode.GetNodeReference("InputSurface") and self._parameterNode.GetNodeReference("InputCenterlines") and self._parameterNode.GetNodeReference("ClipPoints") and self._parameterNode.GetNodeReference("OutputSurfaceModel"):
@@ -195,6 +281,23 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.applyButton.enabled = False
 
     self.updatingGUIFromParameterNode = False
+    if not slicer.mrmlScene.IsBatchProcessing():
+        self.scheduleAutoApply()
+
+  def onSceneBatchProcessEnded(self, caller=None, event=None):
+    """Refresh restored parameters and apply them after scene loading finishes."""
+    if self._parameterNode and slicer.mrmlScene.IsNodePresent(self._parameterNode):
+        self.updateGUIFromParameterNode()
+
+  def ensureOutputSurfaceNode(self, inputSurfaceNode):
+    """Create and select a default output model when an input surface is available."""
+    if not inputSurfaceNode or self._parameterNode.GetNodeReference("OutputSurfaceModel"):
+        return
+    outputName = inputSurfaceNode.GetName() + " clipped"
+    outputModelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", outputName)
+    outputModelNode.CreateDefaultDisplayNodes()
+    self._parameterNode.SetNodeReferenceID("OutputSurfaceModel", outputModelNode.GetID())
+    self.ui.outputSurfaceModelSelector.setCurrentNode(outputModelNode)
 
   def updateParameterNodeFromGUI(self, caller=None, event=None):
     """
@@ -224,38 +327,549 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self._parameterNode.SetParameter("ExtendOutputSurface", "true" if self.ui.addFlowExtensionsCheckBox.checked else "false")
     self._parameterNode.SetParameter("ExtensionLength", str(self.ui.extensionLengthWidget.value))
     self._parameterNode.SetParameter("ExtensionMode", self.ui.extensionModeComboBox.currentText)
+    self._parameterNode.SetParameter("AutoApplyPlane", "true" if self.ui.applyButton.checked else "false")
+    self._parameterNode.SetParameter("ClipPointInsetFactor", str(self.ui.clipPointInsetFactorWidget.value))
+    self._parameterNode.SetParameter("SnapClipPointsToCenterline", "true" if self.ui.snapClipPointsToCenterlineCheckBox.checked else "false")
+    self._parameterNode.SetParameter("ClippingMethod", self.ui.clippingMethodComboBox.currentText)
+    self._parameterNode.SetParameter("LocalSphereRadiusFactor", str(self.ui.localSphereRadiusFactorWidget.value))
+    self._parameterNode.SetParameter("FreeNormalHandle", "true" if self.ui.freeNormalHandleCheckBox.checked else "false")
     self._parameterNode.EndModify(wasModify)
+    self.scheduleAutoApply()
+
+  def observeClipPointsNode(self, clipPointsNode):
+    """Observe point interaction, not display hover, to select the endpoint plane."""
+    if clipPointsNode == self._observedClipPointsNode:
+        return
+    if self._observedClipPointsNode:
+        self.removeObserver(self._observedClipPointsNode, slicer.vtkMRMLMarkupsNode.PointStartInteractionEvent, self.onClipPointInteractionStarted)
+        self.removeObserver(self._observedClipPointsNode, slicer.vtkMRMLMarkupsNode.PointModifiedEvent, self.onClipPointModified)
+        self.removeObserver(self._observedClipPointsNode, slicer.vtkMRMLMarkupsNode.PointEndInteractionEvent, self.onClipPointInteractionEnded)
+    self._observedClipPointsNode = clipPointsNode
+    if clipPointsNode:
+        clipPointsNode.CreateDefaultDisplayNodes()
+        displayNode = clipPointsNode.GetDisplayNode()
+        if displayNode:
+            displayNode.SetPointLabelsVisibility(True)
+            if hasattr(displayNode, "SetOccludedVisibility"):
+                displayNode.SetOccludedVisibility(True)
+        self.addObserver(clipPointsNode, slicer.vtkMRMLMarkupsNode.PointStartInteractionEvent, self.onClipPointInteractionStarted)
+        self.addObserver(clipPointsNode, slicer.vtkMRMLMarkupsNode.PointModifiedEvent, self.onClipPointModified)
+        self.addObserver(clipPointsNode, slicer.vtkMRMLMarkupsNode.PointEndInteractionEvent, self.onClipPointInteractionEnded)
+        self.updateClipPointsSnapMode()
+
+  def onSnapClipPointsToCenterlineToggled(self, checked=None):
+    self.updateParameterNodeFromGUI()
+    self.updateClipPointsSnapMode()
+
+  def onFreeNormalHandleToggled(self, checked=None):
+    self.updateParameterNodeFromGUI()
+    self.updatePlaneHandleMode()
+
+  def onClippingMethodChanged(self, index=None):
+    self.updateParameterNodeFromGUI()
+    self.updateClippingMethodUI(self.ui.clippingMethodComboBox.currentText)
+
+  def updateClippingMethodUI(self, clippingMethod):
+    localSphere = clippingMethod == "Plane + local sphere"
+    self.ui.localSphereRadiusFactorLabel.setVisible(localSphere)
+    self.ui.localSphereRadiusFactorWidget.setVisible(localSphere)
+
+  def updatePlaneHandleMode(self):
+    planeNode = self._parameterNode.GetNodeReference("ManualClipPlane") if self._parameterNode else None
+    normalHandleNode = self._parameterNode.GetNodeReference("ManualClipPlaneNormalHandle") if self._parameterNode else None
+    useFreeNormalHandle = self.ui.freeNormalHandleCheckBox.checked if self._parameterNode else False
+    useStandardHandles = not useFreeNormalHandle
+    if planeNode and planeNode.GetDisplayNode():
+        displayNode = planeNode.GetDisplayNode()
+        displayNode.SetHandlesInteractive(useStandardHandles)
+        displayNode.SetRotationHandleVisibility(useStandardHandles)
+        displayNode.SetTranslationHandleVisibility(useStandardHandles)
+        displayNode.SetScaleHandleVisibility(False)
+    if normalHandleNode:
+        normalHandleNode.SetDisplayVisibility(self._planeEditing and useFreeNormalHandle)
+
+  def snapOriginToCenterline(self, origin):
+    """Return origin snapped onto the input centerline, or origin unchanged if centerline
+    snapping is disabled, no centerline is set, or the centerline has no points."""
+    if not self.ui.snapClipPointsToCenterlineCheckBox.checked:
+        return origin
+    centerlinesNode = self._parameterNode.GetNodeReference("InputCenterlines")
+    if not centerlinesNode:
+        return origin
+    snappedOrigin = self.logic.closestPointOnCenterline(centerlinesNode, origin)
+    return snappedOrigin if snappedOrigin is not None else origin
+
+  def updateClipPointsSnapMode(self):
+    """When centerline-snapping is enabled, custom logic in onClipPointModified() takes over
+    positioning, so the native display-node snap mode is left unconstrained. When disabled,
+    fall back to Slicer's built-in snap-to-visible-surface behavior."""
+    clipPointsNode = self._observedClipPointsNode
+    if not clipPointsNode:
+        return
+    displayNode = clipPointsNode.GetDisplayNode()
+    if not displayNode:
+        return
+    if self.ui.snapClipPointsToCenterlineCheckBox.checked:
+        displayNode.SetSnapMode(slicer.vtkMRMLMarkupsDisplayNode.SnapModeUnconstrained)
+    else:
+        displayNode.SetSnapMode(slicer.vtkMRMLMarkupsDisplayNode.SnapModeToVisibleSurface)
+
+  def updateInputSurfaceOpacity(self, inputSurfaceNode, opacity=0.4):
+    """Keep the input surface see-through so clip points and their planes, which sit on or
+    near its surface, stay visible underneath it. Handles both model and segmentation inputs."""
+    if not inputSurfaceNode:
+        return
+    if not inputSurfaceNode.GetDisplayNode():
+        inputSurfaceNode.CreateDefaultDisplayNodes()
+    displayNode = inputSurfaceNode.GetDisplayNode()
+    if not displayNode:
+        return
+    if inputSurfaceNode.IsA("vtkMRMLSegmentationNode"):
+        displayNode.SetOpacity3D(opacity)
+    else:
+        displayNode.SetOpacity(opacity)
+
+  def updateOutputVisibilityButton(self):
+    """Sync the Outputs show/hide button with the output model's actual display visibility,
+    without triggering onToggleOutputVisibilityButton (which would otherwise flip visibility
+    right back)."""
+    outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel") if self._parameterNode else None
+    displayNode = outputModelNode.GetDisplayNode() if outputModelNode else None
+    self.ui.toggleOutputVisibilityButton.enabled = displayNode is not None
+    visible = displayNode.GetVisibility() if displayNode else True
+    wasBlocked = self.ui.toggleOutputVisibilityButton.blockSignals(True)
+    self.ui.toggleOutputVisibilityButton.checked = visible
+    self.ui.toggleOutputVisibilityButton.toolTip = "Hide output surface" if visible else "Show output surface"
+    self.ui.toggleOutputVisibilityButton.blockSignals(wasBlocked)
+
+  def onToggleOutputVisibilityButton(self, checked=None):
+    outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel") if self._parameterNode else None
+    displayNode = outputModelNode.GetDisplayNode() if outputModelNode else None
+    if displayNode:
+        displayNode.SetVisibility(checked)
+    self.ui.toggleOutputVisibilityButton.toolTip = "Hide output surface" if checked else "Show output surface"
+
+  def updateOutputEdgesButton(self):
+    """Sync the Outputs edge toggle with the output model display node."""
+    outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel") if self._parameterNode else None
+    displayNode = outputModelNode.GetDisplayNode() if outputModelNode else None
+    self.ui.toggleOutputEdgesButton.enabled = displayNode is not None
+    edgeVisible = displayNode.GetEdgeVisibility() if displayNode else False
+    wasBlocked = self.ui.toggleOutputEdgesButton.blockSignals(True)
+    self.ui.toggleOutputEdgesButton.checked = edgeVisible
+    self.ui.toggleOutputEdgesButton.blockSignals(wasBlocked)
+
+  def onToggleOutputEdgesButton(self, checked=None):
+    outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel") if self._parameterNode else None
+    displayNode = outputModelNode.GetDisplayNode() if outputModelNode else None
+    if displayNode:
+        displayNode.SetEdgeVisibility(checked)
+
+  def updateInputVisibilityButtons(self):
+    for button, roleName, objectName in self.inputVisibilityButtons:
+        node = self._parameterNode.GetNodeReference(roleName) if self._parameterNode else None
+        displayNode = node.GetDisplayNode() if node else None
+        button.enabled = displayNode is not None
+        visible = displayNode.GetVisibility() if displayNode else True
+        wasBlocked = button.blockSignals(True)
+        button.checked = visible
+        button.toolTip = "Hide %s" % objectName if visible else "Show %s" % objectName
+        button.blockSignals(wasBlocked)
+
+  def onToggleNodeVisibility(self, roleName, checked, button, objectName):
+    node = self._parameterNode.GetNodeReference(roleName) if self._parameterNode else None
+    displayNode = node.GetDisplayNode() if node else None
+    if displayNode:
+        displayNode.SetVisibility(checked)
+    button.toolTip = "Hide %s" % objectName if checked else "Show %s" % objectName
+
+  def finishPlaneEditing(self):
+    """Hide temporary plane markups and leave interactive plane editing mode."""
+    planeNode = self._parameterNode.GetNodeReference("ManualClipPlane") if self._parameterNode else None
+    normalHandleNode = self._parameterNode.GetNodeReference("ManualClipPlaneNormalHandle") if self._parameterNode else None
+    if planeNode:
+        planeNode.SetDisplayVisibility(False)
+    if normalHandleNode:
+        normalHandleNode.SetDisplayVisibility(False)
+    self._activeClipPointIndex = -1
+    self._planeEditing = False
+    self.ui.finishPlaneEditingButton.enabled = False
+    self.ui.clipStatusLabel.text = "Plane editing finished. Click a clip point to edit another plane."
+    self.ui.clipStatusLabel.styleSheet = ""
+
+  def observeInteractivePlaneNode(self, planeNode):
+    if planeNode == self._observedInteractivePlaneNode:
+        return
+    if self._observedInteractivePlaneNode:
+        self.removeObserver(self._observedInteractivePlaneNode, slicer.vtkMRMLMarkupsNode.PointModifiedEvent, self.onInteractivePlaneModified)
+        self.removeObserver(self._observedInteractivePlaneNode, slicer.vtkMRMLMarkupsNode.PointEndInteractionEvent, self.onInteractivePlaneInteractionEnded)
+    self._observedInteractivePlaneNode = planeNode
+    if planeNode:
+        self.addObserver(planeNode, slicer.vtkMRMLMarkupsNode.PointModifiedEvent, self.onInteractivePlaneModified)
+        self.addObserver(planeNode, slicer.vtkMRMLMarkupsNode.PointEndInteractionEvent, self.onInteractivePlaneInteractionEnded)
+
+  def observeNormalHandleNode(self, handleNode):
+    """Observe the separate draggable point that represents the tip of the plane's normal vector."""
+    if handleNode == self._observedNormalHandleNode:
+        return
+    if self._observedNormalHandleNode:
+        self.removeObserver(self._observedNormalHandleNode, slicer.vtkMRMLMarkupsNode.PointModifiedEvent, self.onNormalHandleModified)
+        self.removeObserver(self._observedNormalHandleNode, slicer.vtkMRMLMarkupsNode.PointEndInteractionEvent, self.onNormalHandleInteractionEnded)
+    self._observedNormalHandleNode = handleNode
+    if handleNode:
+        self.addObserver(handleNode, slicer.vtkMRMLMarkupsNode.PointModifiedEvent, self.onNormalHandleModified)
+        self.addObserver(handleNode, slicer.vtkMRMLMarkupsNode.PointEndInteractionEvent, self.onNormalHandleInteractionEnded)
+
+  def repositionNormalHandle(self, origin, normal):
+    """Keep the normal handle glued to the plane: origin + normal * (last chosen handle distance)."""
+    normalHandleNode = self._parameterNode.GetNodeReference("ManualClipPlaneNormalHandle") if self._parameterNode else None
+    if not normalHandleNode or normalHandleNode.GetNumberOfControlPoints() == 0:
+        return
+    newHandlePosition = [origin[axis] + normal[axis] * self._normalHandleDistance for axis in range(3)]
+    normalHandleNode.SetNthControlPointPositionWorld(0, newHandlePosition)
+
+  def manualPlaneNormalsFromParameterNode(self):
+    try:
+        normals = json.loads(self._parameterNode.GetParameter("ManualClipPlaneNormals") or "{}")
+        return {pointId: [float(value) for value in normal] for pointId, normal in normals.items()}
+    except (ValueError, TypeError):
+        logging.warning("Ignoring invalid saved Clip Vessel plane normals")
+        return {}
+
+  def manualPlaneOriginsFromParameterNode(self):
+    try:
+        origins = json.loads(self._parameterNode.GetParameter("ManualClipPlaneOrigins") or "{}")
+        return {pointId: [float(value) for value in origin] for pointId, origin in origins.items()}
+    except (ValueError, TypeError):
+        logging.warning("Ignoring invalid saved Clip Vessel plane origins")
+        return {}
+
+  def saveManualPlaneNormals(self):
+    if self._parameterNode:
+        self._parameterNode.SetParameter("ManualClipPlaneNormals", json.dumps(self._manualPlaneNormals, separators=(",", ":")))
+        self._parameterNode.SetParameter("ManualClipPlaneOrigins", json.dumps(self._manualPlaneOrigins, separators=(",", ":")))
+
+  def onClipPointInteractionStarted(self, caller=None, event=None):
+    displayNode = caller.GetDisplayNode() if caller else None
+    if not displayNode or displayNode.GetActiveComponentType() != slicer.vtkMRMLMarkupsDisplayNode.ComponentControlPoint:
+        return
+    pointIndex = displayNode.GetActiveComponentIndex()
+    if 0 <= pointIndex < caller.GetNumberOfControlPoints():
+        # A plain click to select an endpoint fires Start/End the same as a real drag, even
+        # with no movement in between. Remember where the point started so the End handler
+        # can tell the two apart and skip re-clipping when nothing actually moved.
+        startPosition = [0.0, 0.0, 0.0]
+        caller.GetNthControlPointPositionWorld(pointIndex, startPosition)
+        self._clipPointDragStartPosition = tuple(startPosition)
+        self.showInteractiveClipPlane(pointIndex)
+
+  def showInteractiveClipPlane(self, pointIndex):
+    clipPointsNode = self._parameterNode.GetNodeReference("ClipPoints")
+    centerlinesNode = self._parameterNode.GetNodeReference("InputCenterlines")
+    if not clipPointsNode or not centerlinesNode:
+        return
+
+    planeNode = self._parameterNode.GetNodeReference("ManualClipPlane")
+    if not planeNode:
+        planeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsPlaneNode", "Clip plane adjustment")
+        planeNode.CreateDefaultDisplayNodes()
+        planeNode.SetHideFromEditors(True)
+        planeDisplayNode = planeNode.GetDisplayNode()
+        if planeDisplayNode:
+            # Hide the floating "Clip plane adjustment" name/measurement annotation.
+            planeDisplayNode.SetPropertiesLabelVisibility(False)
+            planeDisplayNode.SetPointLabelsVisibility(False)
+        self._parameterNode.SetNodeReferenceID("ManualClipPlane", planeNode.GetID())
+    self.observeInteractivePlaneNode(planeNode)
+
+    normalHandleNode = self._parameterNode.GetNodeReference("ManualClipPlaneNormalHandle")
+    if not normalHandleNode:
+        normalHandleNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "Clip plane normal handle")
+        normalHandleNode.CreateDefaultDisplayNodes()
+        normalHandleNode.SetHideFromEditors(True)
+        handleDisplayNode = normalHandleNode.GetDisplayNode()
+        if handleDisplayNode:
+            handleDisplayNode.SetGlyphScale(2.0)
+            handleDisplayNode.SetColor(1.0, 0.6, 0.0)
+            handleDisplayNode.SetSelectedColor(1.0, 0.6, 0.0)
+            handleDisplayNode.SetPointLabelsVisibility(False)
+            handleDisplayNode.SetPropertiesLabelVisibility(False)
+            # Don't let this handle snap onto the model surface while dragging: it represents
+            # a direction in free space, not a point on the vessel.
+            handleDisplayNode.SetSnapMode(slicer.vtkMRMLMarkupsDisplayNode.SnapModeUnconstrained)
+        self._parameterNode.SetNodeReferenceID("ManualClipPlaneNormalHandle", normalHandleNode.GetID())
+    self.observeNormalHandleNode(normalHandleNode)
+
+    automaticOrigin, automaticNormal, radius = self.logic.automaticClipPlane(centerlinesNode, clipPointsNode, pointIndex)
+    pointId = clipPointsNode.GetNthControlPointID(pointIndex)
+    origin = self._manualPlaneOrigins.get(pointId, automaticOrigin)
+    normal = self._manualPlaneNormals.get(pointId, automaticNormal)
+    self._normalHandleDistance = max(radius * 2.0, 1.0)
+
+    self._activeClipPointIndex = pointIndex
+    self._planeEditing = True
+    self._updatingInteractivePlane = True  # suppress re-entrant modified events during setup
+    wasModify = planeNode.StartModify()
+    planeNode.RemoveAllControlPoints()
+    planeNode.SetPlaneType(slicer.vtkMRMLMarkupsPlaneNode.PlaneTypePointNormal)
+    planeNode.AddControlPointWorld(vtk.vtkVector3d(origin))
+    planeNode.SetNormalWorld(normal)
+    # Purely cosmetic: the rendered rectangle's size has no effect on the actual cut, which is
+    # now an infinite plane bounded only by mesh connectivity.
+    planeNode.SetSize(radius * 4.0, radius * 4.0)
+    planeNode.EndModify(wasModify)
+    planeNode.SetDisplayVisibility(True)
+    handleWasModify = normalHandleNode.StartModify()
+    normalHandleNode.RemoveAllControlPoints()
+    normalHandlePoint = [origin[axis] + normal[axis] * self._normalHandleDistance for axis in range(3)]
+    normalHandleNode.AddControlPointWorld(vtk.vtkVector3d(normalHandlePoint))
+    normalHandleNode.SetNthControlPointLabel(0, "Normal")
+    normalHandleNode.EndModify(handleWasModify)
+    normalHandleNode.SetDisplayVisibility(True)
+    self.updatePlaneHandleMode()
+    self._updatingInteractivePlane = False
+
+    slicer.modules.markups.logic().SetActiveListID(planeNode)
+    self.ui.finishPlaneEditingButton.enabled = True
+    self.ui.clipStatusLabel.text = "Adjusting %s: drag the center point to move it, or drag the orange handle to set the normal.%s" % (
+        clipPointsNode.GetNthControlPointLabel(pointIndex),
+        " Changes apply when released." if self.ui.applyButton.checked else " Click Apply when ready.")
+    self.ui.clipStatusLabel.styleSheet = ""
+
+  def onInteractivePlaneModified(self, caller=None, event=None):
+    if self._updatingInteractivePlane or self._activeClipPointIndex < 0:
+        return
+    clipPointsNode = self._parameterNode.GetNodeReference("ClipPoints")
+    if not clipPointsNode or self._activeClipPointIndex >= clipPointsNode.GetNumberOfControlPoints():
+        return
+    origin, normal = self.logic.manualPlaneOriginNormal(caller)
+    # The plane markup's control point sits on top of the clip-point fiducial, so dragging the
+    # plane lands here instead of in onClipPointModified; snap it the same way so it stays on the
+    # centerline rather than being pulled onto the input surface.
+    origin = self.snapOriginToCenterline(origin)
+    pointId = clipPointsNode.GetNthControlPointID(self._activeClipPointIndex)
+    self._manualPlaneOrigins[pointId] = list(origin)
+    self._manualPlaneNormals[pointId] = list(normal)
+    self._updatingInteractivePlane = True  # suppress re-entrant modified events from our writes
+    clipPointsNode.SetNthControlPointPositionWorld(self._activeClipPointIndex, origin)
+    caller.SetOriginWorld(origin)  # keep the plane on the snapped origin too
+    self.repositionNormalHandle(origin, normal)
+    self._updatingInteractivePlane = False
+
+  def onClipPointModified(self, caller=None, event=None):
+    if self._updatingInteractivePlane or self._activeClipPointIndex < 0:
+        return
+    planeNode = self._parameterNode.GetNodeReference("ManualClipPlane")
+    if not planeNode or self._activeClipPointIndex >= caller.GetNumberOfControlPoints():
+        return
+    origin = [0.0, 0.0, 0.0]
+    caller.GetNthControlPointPositionWorld(self._activeClipPointIndex, origin)
+    # Keep the dragged point on the centerline (no-op when snapping is disabled).
+    origin = self.snapOriginToCenterline(origin)
+
+    self._updatingInteractivePlane = True  # suppress re-entrant modified events from our writes
+    caller.SetNthControlPointPositionWorld(self._activeClipPointIndex, origin)
+    planeNode.SetOriginWorld(origin)
+    normal = [0.0, 0.0, 1.0]
+    planeNode.GetNormalWorld(normal)
+    self.repositionNormalHandle(origin, normal)
+    self._updatingInteractivePlane = False
+
+  def onNormalHandleModified(self, caller=None, event=None):
+    """Fires while the user drags the orange normal-handle point; re-orients the plane to match."""
+    if self._updatingInteractivePlane or self._activeClipPointIndex < 0:
+        return
+    planeNode = self._parameterNode.GetNodeReference("ManualClipPlane")
+    if not planeNode or not caller or caller.GetNumberOfControlPoints() == 0:
+        return
+    origin = [0.0, 0.0, 0.0]
+    planeNode.GetOriginWorld(origin)
+    handlePosition = [0.0, 0.0, 0.0]
+    caller.GetNthControlPointPositionWorld(0, handlePosition)
+    normal = [handlePosition[axis] - origin[axis] for axis in range(3)]
+    length = vtk.vtkMath.Norm(normal)
+    if length < 1e-6:
+        # Handle dragged onto the origin: ignore, keep the previous normal.
+        return
+    vtk.vtkMath.Normalize(normal)
+    self._normalHandleDistance = length
+    self._updatingInteractivePlane = True
+    planeNode.SetNormalWorld(normal)
+    self._updatingInteractivePlane = False
+
+  def onNormalHandleInteractionEnded(self, caller=None, event=None):
+    self.onNormalHandleModified(caller, event)
+    clipPointsNode = self._parameterNode.GetNodeReference("ClipPoints")
+    planeNode = self._parameterNode.GetNodeReference("ManualClipPlane")
+    if clipPointsNode and planeNode and 0 <= self._activeClipPointIndex < clipPointsNode.GetNumberOfControlPoints():
+        pointId = clipPointsNode.GetNthControlPointID(self._activeClipPointIndex)
+        origin, normal = self.logic.manualPlaneOriginNormal(planeNode)
+        self._manualPlaneOrigins[pointId] = list(origin)
+        self._manualPlaneNormals[pointId] = list(normal)
+        self.saveManualPlaneNormals()
+    self.scheduleAutoApply()
+
+  def onInteractivePlaneInteractionEnded(self, caller=None, event=None):
+    self.onInteractivePlaneModified(caller, event)
+    self.saveManualPlaneNormals()
+    self.scheduleAutoApply()
+
+  def onClipPointInteractionEnded(self, caller=None, event=None):
+    self.onClipPointModified(caller, event)
+    planeNode = self._parameterNode.GetNodeReference("ManualClipPlane")
+    if planeNode:
+        self.onInteractivePlaneModified(planeNode)
+        self.saveManualPlaneNormals()
+
+    # Only re-clip if the point actually moved. A plain click to select a different
+    # endpoint fires this same End event with zero movement; it should just show that
+    # endpoint's plane (already done above), not trigger a re-clip.
+    moved = True
+    if caller and self._clipPointDragStartPosition is not None and 0 <= self._activeClipPointIndex < caller.GetNumberOfControlPoints():
+        endPosition = [0.0, 0.0, 0.0]
+        caller.GetNthControlPointPositionWorld(self._activeClipPointIndex, endPosition)
+        moved = vtk.vtkMath.Distance2BetweenPoints(self._clipPointDragStartPosition, endPosition) > 1e-8
+    self._clipPointDragStartPosition = None
+
+    if moved:
+        self.scheduleAutoApply()
+
+  def onDetectClipPointsButton(self):
+    """Populate ClipPoints with one point per centerline terminus (the inlet plus every
+    branch outlet), each pulled inward from the vessel surface by the configured inset.
+    ExtractCenterline places its endpoints exactly on the vessel surface, which previously
+    meant the user had to manually drag every clip point inward before its plane was
+    positioned correctly; this detects and insets them automatically instead."""
+    if not self._parameterNode:
+        return
+    centerlinesNode = self._parameterNode.GetNodeReference("InputCenterlines")
+    if not centerlinesNode:
+        slicer.util.errorDisplay("Select input centerlines first.")
+        return
+
+    insetFactor = self.ui.clipPointInsetFactorWidget.value
+    try:
+        terminuses = self.logic.detectCenterlineTerminusClipPoints(centerlinesNode, insetFactor)
+    except Exception as e:
+        slicer.util.errorDisplay("Failed to detect clip points: " + str(e))
+        return
+    if not terminuses:
+        slicer.util.errorDisplay("Could not detect any centerline terminuses. Check the input centerlines.")
+        return
+
+    clipPointsNode = self._parameterNode.GetNodeReference("ClipPoints")
+    if not clipPointsNode:
+        clipPointsNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "Clip points")
+        self._parameterNode.SetNodeReferenceID("ClipPoints", clipPointsNode.GetID())
+    elif clipPointsNode.GetNumberOfControlPoints() > 0:
+        if not slicer.util.confirmYesNoDisplay(
+                "This will replace the %d existing clip point(s) with points detected from the centerline. Continue?"
+                % clipPointsNode.GetNumberOfControlPoints()):
+            return
+
+    # Stop showing/adjusting whatever plane was up before the points underneath it are replaced.
+    self._activeClipPointIndex = -1
+    self._planeEditing = False
+    self.ui.finishPlaneEditingButton.enabled = False
+    planeNode = self._parameterNode.GetNodeReference("ManualClipPlane")
+    if planeNode:
+        planeNode.SetDisplayVisibility(False)
+    normalHandleNode = self._parameterNode.GetNodeReference("ManualClipPlaneNormalHandle")
+    if normalHandleNode:
+        normalHandleNode.SetDisplayVisibility(False)
+
+    wasModify = clipPointsNode.StartModify()
+    clipPointsNode.RemoveAllControlPoints()
+    for terminus in terminuses:
+        index = clipPointsNode.AddControlPointWorld(vtk.vtkVector3d(terminus["position"]))
+        clipPointsNode.SetNthControlPointLabel(index, terminus["label"])
+    clipPointsNode.EndModify(wasModify)
+
+    # Previously saved manual normal/origin overrides were keyed by the old (now removed)
+    # control point IDs; drop them so each new point starts from its own automatic plane.
+    self._manualPlaneNormals = {}
+    self._manualPlaneOrigins = {}
+    self.saveManualPlaneNormals()
+
+    self.updateGUIFromParameterNode()
+    self.ui.clipStatusLabel.text = "Detected %d clip point(s) from the centerline (inlet + %d outlet(s))." % (
+        len(terminuses), len(terminuses) - 1)
+    self.ui.clipStatusLabel.styleSheet = "QLabel { color: #008000; }"
+
+  def scheduleAutoApply(self):
+    if (not self._applying and not self.updatingGUIFromParameterNode
+        and self.ui.applyButton.checked
+        and self.ui.applyButton.enabled):
+        self.autoApplyTimer.start()
+
+  def onAutoApplyTimeout(self):
+    if not self._applying and not self.updatingGUIFromParameterNode:
+        self.onApplyButton()
 
   def getPreprocessedPolyData(self):
-  
-    inputSurfacePolyData = self.logic.polyDataFromNode(self._parameterNode.GetNodeReference("InputSurface"),
-                                                       self._parameterNode.GetParameter("InputSegmentID"))
-    if not inputSurfacePolyData or inputSurfacePolyData.GetNumberOfPoints() == 0:
+    inputSurfaceNode = self._parameterNode.GetNodeReference("InputSurface")
+    if not inputSurfaceNode:
         raise ValueError("Valid input surface is required")
+    segmentId = self._parameterNode.GetParameter("InputSegmentID")
+
+    # Cheap staleness check BEFORE materializing the input surface. For a segmentation node,
+    # self.logic.polyDataFromNode() below calls CreateClosedSurfaceRepresentation() plus a full
+    # mesh copy, which is expensive and was previously being re-run on every single apply/drag
+    # release regardless of whether the segmentation had actually changed. Use the source node's
+    # own MTime (or the model's polydata MTime) as a cheap proxy instead, and only pay for the
+    # real extraction when something has actually changed.
+    if inputSurfaceNode.IsA("vtkMRMLSegmentationNode"):
+        sourceMTime = inputSurfaceNode.GetMTime()
+    else:
+        existingPolyData = inputSurfaceNode.GetPolyData() if inputSurfaceNode.IsA("vtkMRMLModelNode") else None
+        sourceMTime = existingPolyData.GetMTime() if existingPolyData else inputSurfaceNode.GetMTime()
 
     preprocessEnabled = (self._parameterNode.GetParameter("PreprocessInputSurface") == "true")
-    if not preprocessEnabled:
-        return inputSurfacePolyData
     targetNumberOfPoints = float(self._parameterNode.GetParameter("TargetNumberOfPoints"))
     decimationAggressiveness = float(self._parameterNode.GetParameter("DecimationAggressiveness"))
     subdivideInputSurface = (self._parameterNode.GetParameter("SubdivideInputSurface") == "true")
-    preprocessedPolyData = self.logic.preprocess(inputSurfacePolyData, targetNumberOfPoints, decimationAggressiveness, subdivideInputSurface)
-    print(f"Target points: {targetNumberOfPoints}... Number of points in preprocessed surface:  {preprocessedPolyData.GetNumberOfPoints()}")
-    return preprocessedPolyData
+    cacheKey = (self._parameterNode.GetNodeReferenceID("InputSurface"), sourceMTime, segmentId,
+                preprocessEnabled, targetNumberOfPoints, decimationAggressiveness, subdivideInputSurface)
+    if cacheKey == self._preprocessedCacheKey and self._preprocessedPolyData is not None:
+        return self._preprocessedPolyData
+
+    inputSurfacePolyData = self.logic.polyDataFromNode(inputSurfaceNode, segmentId)
+    if not inputSurfacePolyData or inputSurfacePolyData.GetNumberOfPoints() == 0:
+        raise ValueError("Valid input surface is required")
+
+    if not preprocessEnabled:
+        resultPolyData = inputSurfacePolyData
+    else:
+        resultPolyData = self.logic.preprocess(inputSurfacePolyData, targetNumberOfPoints, decimationAggressiveness, subdivideInputSurface)
+        print(f"Target points: {targetNumberOfPoints}... Number of points in preprocessed surface:  {resultPolyData.GetNumberOfPoints()}")
+
+    self._preprocessedCacheKey = cacheKey
+    self._preprocessedPolyData = vtk.vtkPolyData()
+    self._preprocessedPolyData.DeepCopy(resultPolyData)
+    return self._preprocessedPolyData
 
   def onApplyButton(self):
     """
-    Run processing when user clicks "Apply" button.
+    Run processing when user clicks "Apply" button (also called after every interactive
+    plane edit, debounced). Always runs the full pipeline, including capping, flow
+    extensions, and the planarity check, so the displayed model is always the real result.
     """
+    if self._applying:
+        return
+    if self.autoApplyTimer.isActive():
+        self.autoApplyTimer.stop()
+    self._applying = True
     qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
     try:
         # Preprocessing
         slicer.util.showStatusMessage("Preprocessing...")
         slicer.app.processEvents()  # force update
         preprocessedPolyData = self.getPreprocessedPolyData()
-        # Save preprocessing result to model node
+        # Save preprocessing result to model node. Skip the (surprisingly non-trivial)
+        # SetAndObserveMesh + render update when it's the exact same cached polydata as
+        # last time, which is the common case while only a clip plane is being edited.
         preprocessedSurfaceModelNode = self._parameterNode.GetNodeReference("PreprocessedSurface")
-        if preprocessedSurfaceModelNode:
+        if preprocessedSurfaceModelNode and preprocessedSurfaceModelNode.GetPolyData() is not preprocessedPolyData:
             preprocessedSurfaceModelNode.SetAndObserveMesh(preprocessedPolyData)
             if not preprocessedSurfaceModelNode.GetDisplayNode():
                 preprocessedSurfaceModelNode.CreateDefaultDisplayNodes()
@@ -264,33 +878,54 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 preprocessedSurfaceModelNode.GetDisplayNode().SetLineWidth(2)
 
         clipPointsMarkupsNode = self._parameterNode.GetNodeReference("ClipPoints")
-        inputSurfaceModelNode = self._parameterNode.GetNodeReference("InputSurface")
         centerlinesModelNode = self._parameterNode.GetNodeReference("InputCenterlines")
         outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel")
         extensionLength = float(self._parameterNode.GetParameter("ExtensionLength"))
+        self.saveManualPlaneNormals()
 
-        cap = self.ui.capOutputSurfaceModelCheckBox.checked
-        addFlowExtensions = self.ui.addFlowExtensionsCheckBox.checked
+        # Read processing options from the parameter node. The GUI may still be
+        # synchronizing after a saved scene is restored.
+        cap = self._parameterNode.GetParameter("CapOutputSurface") == "true"
+        addFlowExtensions = self._parameterNode.GetParameter("ExtendOutputSurface") == "true"
         extensionMode = self._parameterNode.GetParameter("ExtensionMode")
+        clippingMethod = self._parameterNode.GetParameter("ClippingMethod") or "Plane"
+        sphereRadiusFactor = float(self._parameterNode.GetParameter("LocalSphereRadiusFactor"))
 
         slicer.util.showStatusMessage("Clipping model...")
         slicer.app.processEvents()  # force update
 
-        outputPolyData = self.logic.clipVessel(preprocessedPolyData, centerlinesModelNode, clipPointsMarkupsNode, cap, addFlowExtensions, extensionLength, extensionMode)
-        
+        outputPolyData = self.logic.clipVessel(preprocessedPolyData, centerlinesModelNode, clipPointsMarkupsNode,
+                                               cap, addFlowExtensions, extensionLength, extensionMode,
+                                               self._manualPlaneNormals, self._manualPlaneOrigins,
+                                               self._activeClipPointIndex, clippingMethod, sphereRadiusFactor)
 
         outputModelNode.SetAndObserveMesh(outputPolyData)
         if not outputModelNode.GetDisplayNode():
             outputModelNode.CreateDefaultDisplayNodes()
-            outputModelNode.GetDisplayNode().SetColor(0.0, 1.0, 0.0)
+            outputModelNode.GetDisplayNode().SetColor(0.75, 0.75, 0.75)
             outputModelNode.GetDisplayNode().SetLineWidth(3)
-            inputSurfaceModelNode.GetDisplayNode().SetOpacity(0.4)
+        self.updateOutputVisibilityButton()
+        self.updateOutputEdgesButton()
+
+        if self.logic.lastUnclippedPoints:
+            self.ui.clipStatusLabel.text = ("No cut made at: " + ", ".join(self.logic.lastUnclippedPoints) +
+                ". These points are positioned exactly at, or beyond, the vessel end — move them slightly inward.")
+            self.ui.clipStatusLabel.styleSheet = "QLabel { color: #d08000; }"
+        elif self.logic.lastPlanarityFailures:
+            failedLabels = [result["label"] for result in self.logic.lastPlanarityFailures]
+            self.ui.clipStatusLabel.text = "Capping skipped; non-planar cuts: " + ", ".join(failedLabels)
+            self.ui.clipStatusLabel.styleSheet = "QLabel { color: #d08000; }"
+        else:
+            self.ui.clipStatusLabel.text = "All cuts are planar."
+            self.ui.clipStatusLabel.styleSheet = "QLabel { color: #008000; }"
 
     except Exception as e:
         slicer.util.errorDisplay("Failed to compute results: "+str(e))
         import traceback
         traceback.print_exc()
-    qt.QApplication.restoreOverrideCursor()
+    finally:
+        qt.QApplication.restoreOverrideCursor()
+        self._applying = False
     slicer.util.showStatusMessage("Clipping vessel complete.", 3000)
 
 #
@@ -309,20 +944,6 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
   def __init__(self):
     ScriptedLoadableModuleLogic.__init__(self)
     self.radiusArrayName = 'Radius'
-    self.blankingArrayName = 'Blanking'
-    self.groupIdsArrayName = 'GroupIds'
-    self.tractIdsArrayName = 'TractIds'
-    self.centerlineIdsArrayName = 'CenterlineIds'
-    
-    self.gapLength = 1.0
-    self.tolerance = 0.01
-    self.clipValue = 0.0
-    self.cutoffRadiusFactor = 1E16
-
-    self.groupIds = []
-
-    self.useRadiusInformation = 1
-
     self.Sigma = 1
     self.AdaptiveExtensionLength = 0
     self.AdaptiveExtensionRadius = 1
@@ -332,7 +953,18 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     self.TransitionRatio = 0.25
     self.CenterlineNormalEstimationDistanceRatio = 1.0
     self.TargetNumberOfBoundaryPoints = 50
-    
+
+    self.planarityToleranceMm = 0.01
+    self.lastPlanarityResults = []
+    self.lastPlanarityFailures = []
+    self.lastUnclippedPoints = []
+    self._incrementalClipCacheKey = None
+    self._incrementalClipBaseSurface = None
+    self._centerlineGeometryCacheKey = None
+    self._centerlineGeometryCache = None
+    self._centerlineLocatorCacheKey = None
+    self._centerlineLocator = None
+
   def setDefaultParameters(self, parameterNode):
     """
     Initialize parameter node with default settings.
@@ -347,9 +979,27 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         parameterNode.SetParameter("PreprocessInputSurface", "true")
     if not parameterNode.GetParameter("SubdivideInputSurface"):
         parameterNode.SetParameter("SubdivideInputSurface", "false")
+    if not parameterNode.GetParameter("CapOutputSurface"):
+        parameterNode.SetParameter("CapOutputSurface", "true")
     if not parameterNode.GetParameter("ExtensionLength"):
         parameterNode.SetParameter("ExtensionLength", "5")
-        
+    if not parameterNode.GetParameter("ManualClipPlaneNormals"):
+        parameterNode.SetParameter("ManualClipPlaneNormals", "{}")
+    if not parameterNode.GetParameter("ManualClipPlaneOrigins"):
+        parameterNode.SetParameter("ManualClipPlaneOrigins", "{}")
+    if not parameterNode.GetParameter("AutoApplyPlane"):
+        parameterNode.SetParameter("AutoApplyPlane", "false")
+    if not parameterNode.GetParameter("ClipPointInsetFactor"):
+        parameterNode.SetParameter("ClipPointInsetFactor", "0.5")
+    if not parameterNode.GetParameter("SnapClipPointsToCenterline"):
+        parameterNode.SetParameter("SnapClipPointsToCenterline", "true")
+    if not parameterNode.GetParameter("ClippingMethod"):
+        parameterNode.SetParameter("ClippingMethod", "Plane")
+    if not parameterNode.GetParameter("LocalSphereRadiusFactor"):
+        parameterNode.SetParameter("LocalSphereRadiusFactor", "2.5")
+    if not parameterNode.GetParameter("FreeNormalHandle"):
+        parameterNode.SetParameter("FreeNormalHandle", "false")
+
   def polyDataFromNode(self, surfaceNode, segmentId):
     if not surfaceNode:
         logging.error("Invalid input surface node")
@@ -382,11 +1032,8 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     prepocessedPolyData = extractCenterlineLogic.preprocess(inputSurfacePolyData, targetNumberOfPoints, decimationAggressiveness, subdivideInputSurface)
     return prepocessedPolyData
     
-  def clipModel(self, surface, centerlines, point, reverse):
-    """Clips the model at the given point. Reverse flag indicates whether the clip
-     should be in the direction of the centerline tangent or not"""
-    import vtkvmtkComputationalGeometryPython as vtkvmtkComputationalGeometry
-
+  def computeCenterlineGeometry(self, centerlines):
+    """Compute centerline tangents once so they can be reused for every cut."""
     centerlineGeometry = vtkvmtkComputationalGeometry.vtkvmtkCenterlineGeometry()
     centerlineGeometry.SetInputData(centerlines)
     centerlineGeometry.SetLengthArrayName("Length")
@@ -401,77 +1048,381 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     centerlineGeometry.SetNumberOfSmoothingIterations(50)
     centerlineGeometry.SetSmoothingFactor(0.1)
     centerlineGeometry.Update()
-    centerlines = centerlineGeometry.GetOutput()
+    output = vtk.vtkPolyData()
+    output.DeepCopy(centerlineGeometry.GetOutput())
+    return output
 
+  def getCachedCenterlineGeometry(self, centerlinesNode):
+    """Resampling the centerline and computing Frenet frames is expensive and its result only
+    depends on the centerline node, not on where the clip points/planes are. While the user is
+    dragging a clip plane, this same result would otherwise be recomputed on every single apply
+    and every endpoint click, which is the main reason interactive edits felt slow. Cache it and
+    only recompute when the centerline itself actually changes."""
+    centerlinesPolyData = centerlinesNode.GetPolyData()
+    cacheKey = (centerlinesNode.GetID(), centerlinesPolyData.GetMTime() if centerlinesPolyData else None)
+    if cacheKey == self._centerlineGeometryCacheKey and self._centerlineGeometryCache is not None:
+        return self._centerlineGeometryCache
+    resampledCenterline = self.resampleCenterline(centerlinesPolyData, spacing=0.5)
+    centerlineGeometry = self.computeCenterlineGeometry(resampledCenterline)
+    self._centerlineGeometryCacheKey = cacheKey
+    self._centerlineGeometryCache = centerlineGeometry
+    return centerlineGeometry
+
+  def getCachedCenterlineLocator(self, centerlinesNode):
+    """Point locator over the cached, resampled centerline geometry. Kept in sync with
+    getCachedCenterlineGeometry's own cache key so that snapping a clip point to the
+    centerline on every mouse-move tick during a drag doesn't rebuild a spatial index
+    each time."""
+    centerlines = self.getCachedCenterlineGeometry(centerlinesNode)
+    if self._centerlineLocator is not None and self._centerlineLocatorCacheKey == self._centerlineGeometryCacheKey:
+        return self._centerlineLocator
     locator = vtk.vtkPointLocator()
     locator.SetDataSet(centerlines)
     locator.BuildLocator()
-    pointId = locator.FindClosestPoint(point)
-    
-    if reverse:
-        tangent = [val*-1 for val in centerlines.GetPointData().GetArray("FrenetTangent").GetTuple3(pointId)]
-    else:
-        tangent = centerlines.GetPointData().GetArray("FrenetTangent").GetTuple3(pointId)
-    
-    # define plane normal to the centerlines
-    clipFunctionPlane = vtk.vtkPlane()
-    clipFunctionPlane.SetNormal(tangent)
-    clipFunctionPlane.SetOrigin(point)
-    
-    # define sphere at centerlines point
-    clipFunctionSphere = vtk.vtkSphere()
-    clipFunctionSphere.SetCenter(centerlines.GetPoint(pointId))
-    clipFunctionSphere.SetRadius(centerlines.GetPointData().GetArray("Radius").GetValue(pointId)*2)
+    self._centerlineLocator = locator
+    self._centerlineLocatorCacheKey = self._centerlineGeometryCacheKey
+    return locator
 
-    # boolean merge the implicit plane and sphere so that the end result is a hemi-sphere
-    clipFunctionCombined = vtk.vtkImplicitBoolean()
-    clipFunctionCombined.AddFunction(clipFunctionPlane)
-    clipFunctionCombined.AddFunction(clipFunctionSphere)
-    clipFunctionCombined.SetOperationTypeToIntersection()
-       
+  def closestPointOnCenterline(self, centerlinesNode, position):
+    """World-space position of the centerline point closest to position, or None if the
+    centerline has no points."""
+    centerlines = self.getCachedCenterlineGeometry(centerlinesNode)
+    if centerlines.GetNumberOfPoints() == 0:
+        return None
+    locator = self.getCachedCenterlineLocator(centerlinesNode)
+    pointId = locator.FindClosestPoint(position)
+    if pointId < 0:
+        return None
+    return centerlines.GetPoint(pointId)
+
+  def clipModel(self, surface, planeOrigin, planeNormal, localRadius=None, clippingMethod="Plane", sphereRadiusFactor=2.5):
+    """Remove the end region of the vessel beyond a single plane. planeNormal should point
+    away from the vessel interior, toward the branch end (see orientNormalTowardBranchEnd):
+    everything on that side of the plane is a candidate for removal. In a large branching
+    tree, the same (infinite) plane can also cross other, unrelated branches far from this
+    clip point; connectivity is used to isolate just the one specific connected piece nearest
+    planeOrigin - the actual local end region - and leave anything else the plane happens to
+    also cross untouched.
+    Returns (outputPolyData, clipped, reason). clipped is False when the cut had no effect,
+    in which case reason is "no_surface": nothing exists on the discard side to remove (e.g.
+    the clip point sits exactly at, or beyond, the vessel end). reason is None when clipped
+    is True. Whether a cut that DID happen looks right is left to the user to judge (e.g. via
+    the output status/visualization) rather than rejected automatically here."""
+    clipFunctionPlane = vtk.vtkPlane()
+    clipFunctionPlane.SetOrigin(planeOrigin)
+    clipFunctionPlane.SetNormal(planeNormal)
+    clipFunction = clipFunctionPlane
+    if clippingMethod == "Plane + local sphere" and localRadius and localRadius > 0:
+        # Limit the implicit cut to a neighborhood around the selected vessel end.
+        # This is intentionally opt-in because the additional implicit-function
+        # evaluation is slower than the default infinite-plane path.
+        localSphere = vtk.vtkSphere()
+        localSphere.SetCenter(planeOrigin)
+        localSphere.SetRadius(max(localRadius * sphereRadiusFactor, 1.0))
+        localImplicitFunction = vtk.vtkImplicitBoolean()
+        localImplicitFunction.SetOperationTypeToIntersection()
+        localImplicitFunction.AddFunction(clipFunctionPlane)
+        localImplicitFunction.AddFunction(localSphere)
+        clipFunction = localImplicitFunction
+
     clipper = vtk.vtkClipPolyData()
     clipper.SetInputData(surface)
     clipper.GenerateClippedOutputOn()
-    clipper.SetInsideOut(0)
+    # InsideOut(1) keeps the negative-normal (vessel interior) side as the main output, and
+    # puts the positive-normal (branch end) side - the discard candidate - in the clipped
+    # output.
+    clipper.SetInsideOut(1)
     clipper.GenerateClipScalarsOff()
     clipper.SetValue(0.0)
-    
-    # clip the surface with the hemi-sphere
-    clipper.SetClipFunction(clipFunctionCombined)
+    clipper.SetClipFunction(clipFunction)
     clipper.Update()
-           
-    clippedSurface = vtk.vtkPolyData()    
-    clippedSurface.DeepCopy(clipper.GetClippedOutput())
-       
-    cleaner = vtk.vtkCleanPolyData()
-    cleaner.SetInputData(clippedSurface)
-    cleaner.Update()    
-    clippedSurface = cleaner.GetOutput()
-    
-    return clippedSurface
-    
-    
-  def set_clipper(self, surface, splitCenterlines, groupIds):
-    # if we work under the assumption that group 0 is always kept it will eliminate the use of user interaction to select which groups to keep.
-    branchClipper = vtkvmtkComputationalGeometry.vtkvmtkPolyDataCenterlineGroupsClipper()
-    branchClipper.SetCenterlineGroupIdsArrayName(self.groupIdsArrayName)
-    branchClipper.SetGroupIdsArrayName(self.groupIdsArrayName)
-    branchClipper.SetCenterlineRadiusArrayName(self.radiusArrayName)
-    branchClipper.SetBlankingArrayName(self.blankingArrayName)
-    branchClipper.SetCutoffRadiusFactor(self.cutoffRadiusFactor)
-    branchClipper.SetClipValue(self.clipValue)
-    branchClipper.SetUseRadiusInformation(self.useRadiusInformation)
-    if groupIds.GetNumberOfIds() > 0:
-      branchClipper.ClipAllCenterlineGroupIdsOff()
-      branchClipper.SetCenterlineGroupIds(groupIds)
-      branchClipper.GenerateClippedOutputOn()
-    else:
-      branchClipper.ClipAllCenterlineGroupIdsOn()
-    branchClipper.SetInputData(surface)
-    branchClipper.SetCenterlines(splitCenterlines)
-    branchClipper.Update()
-    return branchClipper
 
+    retainedSurface = clipper.GetOutput()
+    targetSurface = clipper.GetClippedOutput()
+    # A clip point placed exactly at (or beyond) the vessel end can leave one side of the cut
+    # with points but no complete cells (a degenerate sliver): GetNumberOfPoints() alone
+    # won't catch that, but connectivity/region-coloring below requires actual cells to work
+    # with. Treat that the same as an empty side: there's nothing meaningful to cut away, so
+    # leave the surface unchanged instead of continuing into a filter that would fail.
+    if (retainedSurface.GetNumberOfPoints() == 0 or retainedSurface.GetNumberOfCells() == 0
+            or targetSurface.GetNumberOfPoints() == 0 or targetSurface.GetNumberOfCells() == 0):
+        output = vtk.vtkPolyData()
+        output.DeepCopy(surface)
+        return output, False, "no_surface"
+
+    # The discarded side can contain more than one disconnected piece (e.g. the same infinite
+    # plane also crossing another, unrelated branch elsewhere); isolate the one nearest the
+    # clip point itself as the intended local end region, and keep any other piece (debris
+    # still attached to the vessel via the retained side) rather than discarding it too.
+    connectivity = vtk.vtkPolyDataConnectivityFilter()
+    connectivity.SetInputData(targetSurface)
+    connectivity.SetExtractionModeToAllRegions()
+    connectivity.ColorRegionsOn()
+    connectivity.Update()
+    coloredSurface = connectivity.GetOutput()
+    locator = vtk.vtkPointLocator()
+    locator.SetDataSet(coloredSurface)
+    locator.BuildLocator()
+    closestPointId = locator.FindClosestPoint(planeOrigin)
+    regionIdArray = coloredSurface.GetPointData().GetArray("RegionId")
+    if regionIdArray is None or closestPointId < 0:
+        # Degenerate cut: the piece being cut away had no identifiable connected region
+        # (e.g. the clip plane sits exactly at the vessel end with nothing beyond it).
+        # Leave the surface unchanged rather than fail with a cryptic AttributeError.
+        output = vtk.vtkPolyData()
+        output.DeepCopy(surface)
+        return output, False, "no_surface"
+    targetRegionId = int(regionIdArray.GetValue(closestPointId))
+    numberOfTargetRegions = connectivity.GetNumberOfExtractedRegions()
+
+    nonTargetRegions = vtk.vtkPolyDataConnectivityFilter()
+    nonTargetRegions.SetInputData(targetSurface)
+    nonTargetRegions.SetExtractionModeToSpecifiedRegions()
+    for regionId in range(numberOfTargetRegions):
+        if regionId != targetRegionId:
+            nonTargetRegions.AddSpecifiedRegion(regionId)
+    nonTargetRegions.Update()
+
+    # The piece actually being cut away is just the target region (any other, non-target
+    # regions on this side are debris left attached via the retained side, and get kept).
+    append = vtk.vtkAppendPolyData()
+    append.AddInputData(retainedSurface)
+    append.AddInputConnection(nonTargetRegions.GetOutputPort())
+    append.Update()
+    clean = vtk.vtkCleanPolyData()
+    clean.SetInputConnection(append.GetOutputPort())
+    clean.Update()
+    output = vtk.vtkPolyData()
+    output.DeepCopy(clean.GetOutput())
+    return output, True, None
+
+  def automaticClipPlane(self, centerlinesNode, clipPointsMarkupsNode, controlPointIndex):
+    """Return the automatic plane origin, normal, and local radius for a clip point."""
+    centerlines = self.getCachedCenterlineGeometry(centerlinesNode)
+    locator = self.getCachedCenterlineLocator(centerlinesNode)
+    position = [0.0, 0.0, 0.0]
+    clipPointsMarkupsNode.GetNthControlPointPositionWorld(controlPointIndex, position)
+    pointId = locator.FindClosestPoint(position)
+    origin = centerlines.GetPoint(pointId)
+    normal = list(centerlines.GetPointData().GetArray("FrenetTangent").GetTuple3(pointId))
+    normal = self.orientNormalTowardBranchEnd(centerlines, origin, normal)
+    radius = centerlines.GetPointData().GetArray(self.radiusArrayName).GetValue(pointId)
+    return origin, normal, radius
+
+  def findSharedRootEndpoint(self, centerlines, cellEndpointIds):
+    """Given each cell's (startPointId, endPointId), return whichever point id is a shared
+    endpoint of every cell (within a small tolerance), or None if there isn't one (e.g. a
+    single non-branching centerline, or unexpected topology)."""
+    if not cellEndpointIds:
+        return None
+    toleranceSquared = 0.0025  # 0.05 mm
+    for candidatePointId in cellEndpointIds[0]:
+        candidatePosition = centerlines.GetPoint(candidatePointId)
+        sharedByAll = True
+        for otherStart, otherEnd in cellEndpointIds[1:]:
+            startPosition = centerlines.GetPoint(otherStart)
+            endPosition = centerlines.GetPoint(otherEnd)
+            if (vtk.vtkMath.Distance2BetweenPoints(candidatePosition, startPosition) > toleranceSquared and
+                    vtk.vtkMath.Distance2BetweenPoints(candidatePosition, endPosition) > toleranceSquared):
+                sharedByAll = False
+                break
+        if sharedByAll:
+            return candidatePointId
+    return None
+
+  def detectCenterlineTerminusClipPoints(self, centerlinesNode, insetFactor):
+    """Find one clip point per centerline terminus: the shared root (inlet) plus every
+    distinct branch tip (outlet), each pulled inward along the centerline from the vessel
+    surface by insetFactor times the local vessel radius. This avoids landing clip points
+    exactly on the vessel surface (where ExtractCenterline places its endpoints).
+    Returns a list of {"label", "position", "normal"} dicts, inlet first.
+    """
+    centerlines = self.getCachedCenterlineGeometry(centerlinesNode)
+    numberOfCells = centerlines.GetNumberOfCells()
+    if numberOfCells == 0:
+        return []
+
+    tangentArray = centerlines.GetPointData().GetArray("FrenetTangent")
+    radiusArray = centerlines.GetPointData().GetArray(self.radiusArrayName)
+    if tangentArray is None or radiusArray is None:
+        raise ValueError("Centerline is missing tangent/radius information. Re-run centerline extraction and try again.")
+
+    cellEndpointIds = []
+    for cellIndex in range(numberOfCells):
+        cell = centerlines.GetCell(cellIndex)
+        numberOfPoints = cell.GetNumberOfPoints()
+        if numberOfPoints < 2:
+            cellEndpointIds.append(None)
+            continue
+        cellEndpointIds.append((cell.GetPointId(0), cell.GetPointId(numberOfPoints - 1)))
+    validCellIndices = [index for index, endpoints in enumerate(cellEndpointIds) if endpoints is not None]
+    if not validCellIndices:
+        return []
+
+    rootPointId = self.findSharedRootEndpoint(centerlines, [cellEndpointIds[index] for index in validCellIndices])
+
+    def insetFromEndpoint(cell, endpointOffset, step):
+        """Walk along cell from its endpointOffset end, toward the interior, until
+        insetFactor * local radius of arc length has been covered (or the cell runs out).
+        With insetFactor 0, this stays at the endpoint itself."""
+        numberOfPoints = cell.GetNumberOfPoints()
+        endpointPointId = cell.GetPointId(endpointOffset)
+        targetDistance = insetFactor * radiusArray.GetValue(endpointPointId)
+        accumulatedDistance = 0.0
+        previousPosition = centerlines.GetPoint(endpointPointId)
+        reachedPointId = endpointPointId
+        index = endpointOffset
+        while accumulatedDistance < targetDistance:
+            nextIndex = index + step
+            if nextIndex < 0 or nextIndex >= numberOfPoints:
+                break
+            nextPointId = cell.GetPointId(nextIndex)
+            nextPosition = centerlines.GetPoint(nextPointId)
+            accumulatedDistance += vtk.vtkMath.Distance2BetweenPoints(previousPosition, nextPosition) ** 0.5
+            previousPosition = nextPosition
+            reachedPointId = nextPointId
+            index = nextIndex
+        position = centerlines.GetPoint(reachedPointId)
+        normal = list(tangentArray.GetTuple3(reachedPointId))
+        normal = self.orientNormalTowardBranchEnd(centerlines, position, normal)
+        vtk.vtkMath.Normalize(normal)
+        return tuple(position), tuple(normal)
+
+    # Locate the root (inlet) using whichever cell actually contains the shared root point.
+    rootPosition = None
+    rootNormal = None
+    if rootPointId is not None:
+        for cellIndex in validCellIndices:
+            startId, endId = cellEndpointIds[cellIndex]
+            cell = centerlines.GetCell(cellIndex)
+            if startId == rootPointId:
+                rootPosition, rootNormal = insetFromEndpoint(cell, 0, +1)
+                break
+            if endId == rootPointId:
+                rootPosition, rootNormal = insetFromEndpoint(cell, cell.GetNumberOfPoints() - 1, -1)
+                break
+    if rootPosition is None:
+        # No unambiguous shared root found (e.g. a single, non-branching centerline):
+        # fall back to the first cell's start point as the inlet.
+        firstCellIndex = validCellIndices[0]
+        rootPointId = cellEndpointIds[firstCellIndex][0]
+        rootPosition, rootNormal = insetFromEndpoint(centerlines.GetCell(firstCellIndex), 0, +1)
+
+    terminuses = [{"label": "Inlet", "position": rootPosition, "normal": rootNormal}]
+
+    seenLeafPositions = []
+    outletNumber = 0
+    for cellIndex in validCellIndices:
+        startId, endId = cellEndpointIds[cellIndex]
+        cell = centerlines.GetCell(cellIndex)
+        numberOfPoints = cell.GetNumberOfPoints()
+        if startId == rootPointId:
+            leafOffset = numberOfPoints - 1
+        elif endId == rootPointId:
+            leafOffset = 0
+        else:
+            # Cell touches neither identified root endpoint (unexpected topology): treat its
+            # far end as a leaf too, rather than silently dropping it.
+            leafOffset = numberOfPoints - 1
+        leafPointId = cell.GetPointId(leafOffset)
+        leafPosition = centerlines.GetPoint(leafPointId)
+        if any(vtk.vtkMath.Distance2BetweenPoints(leafPosition, seen) < 0.0025 for seen in seenLeafPositions):
+            continue
+        seenLeafPositions.append(leafPosition)
+        outletNumber += 1
+        step = -1 if leafOffset == numberOfPoints - 1 else +1
+        outletPosition, outletNormal = insetFromEndpoint(cell, leafOffset, step)
+        terminuses.append({"label": f"Outlet {outletNumber}", "position": outletPosition, "normal": outletNormal})
+
+    return terminuses
+
+  def orientNormalTowardBranchEnd(self, centerlines, origin, normal):
+    """Orient a tangent away from the vessel interior using the nearest polyline endpoint."""
+    closestEndpoint = None
+    closestInteriorPoint = None
+    closestDistance2 = float("inf")
+    for cellIndex in range(centerlines.GetNumberOfCells()):
+        cell = centerlines.GetCell(cellIndex)
+        numberOfPoints = cell.GetNumberOfPoints()
+        if numberOfPoints < 2:
+            continue
+        for endpointOffset, interiorOffset in ((0, min(2, numberOfPoints - 1)),
+                                               (numberOfPoints - 1, max(0, numberOfPoints - 3))):
+            endpoint = centerlines.GetPoint(cell.GetPointId(endpointOffset))
+            distance2 = vtk.vtkMath.Distance2BetweenPoints(origin, endpoint)
+            if distance2 < closestDistance2:
+                closestDistance2 = distance2
+                closestEndpoint = endpoint
+                closestInteriorPoint = centerlines.GetPoint(cell.GetPointId(interiorOffset))
+    if closestEndpoint is not None:
+        outward = [closestEndpoint[axis] - closestInteriorPoint[axis] for axis in range(3)]
+        if vtk.vtkMath.Dot(normal, outward) < 0.0:
+            normal = [-value for value in normal]
+    return normal
+
+  def manualPlaneOriginNormal(self, planeNode):
+    """Read the interactive plane in world coordinates."""
+    origin = [0.0, 0.0, 0.0]
+    normal = [0.0, 0.0, 1.0]
+    planeNode.GetOriginWorld(origin)
+    planeNode.GetNormalWorld(normal)
+    vtk.vtkMath.Normalize(normal)
+    return origin, normal
+
+  def validateClipPlanes(self, surface, planeSpecifications):
+    """Measure each output boundary loop against its intended clipping plane."""
+    self.lastPlanarityResults = []
+    self.lastPlanarityFailures = []
+    if not planeSpecifications:
+        return
+
+    boundaryEdges = vtk.vtkFeatureEdges()
+    boundaryEdges.SetInputData(surface)
+    boundaryEdges.BoundaryEdgesOn()
+    boundaryEdges.FeatureEdgesOff()
+    boundaryEdges.ManifoldEdgesOff()
+    boundaryEdges.NonManifoldEdgesOff()
+    boundaryEdges.Update()
+
+    connectivity = vtk.vtkPolyDataConnectivityFilter()
+    connectivity.SetInputConnection(boundaryEdges.GetOutputPort())
+    connectivity.SetExtractionModeToAllRegions()
+    connectivity.ColorRegionsOn()
+    connectivity.Update()
+    boundaries = connectivity.GetOutput()
+    regionArray = boundaries.GetPointData().GetArray("RegionId")
+    if not regionArray or boundaries.GetNumberOfPoints() == 0:
+        for specification in planeSpecifications:
+            result = {**specification, "maximumErrorMm": float("inf"), "reason": "Missing boundary"}
+            self.lastPlanarityResults.append(result)
+            self.lastPlanarityFailures.append(result)
+        return
+
+    points = vtk_to_numpy(boundaries.GetPoints().GetData())
+    regionIds = vtk_to_numpy(regionArray).astype(int)
+    regions = []
+    for regionId in np.unique(regionIds):
+        regionPoints = points[regionIds == regionId]
+        regions.append((int(regionId), regionPoints, np.mean(regionPoints, axis=0)))
+
+    availableRegionIndices = set(range(len(regions)))
+    for specification in planeSpecifications:
+        if not availableRegionIndices:
+            result = {**specification, "maximumErrorMm": float("inf"), "reason": "Missing boundary"}
+        else:
+            origin = np.asarray(specification["origin"])
+            normal = np.asarray(specification["normal"])
+            regionIndex = min(availableRegionIndices,
+                              key=lambda index: np.linalg.norm(regions[index][2] - origin))
+            availableRegionIndices.remove(regionIndex)
+            regionPoints = regions[regionIndex][1]
+            maximumError = float(np.max(np.abs((regionPoints - origin).dot(normal))))
+            result = {**specification, "maximumErrorMm": maximumError, "reason": ""}
+        self.lastPlanarityResults.append(result)
+        if result["maximumErrorMm"] > self.planarityToleranceMm:
+            self.lastPlanarityFailures.append(result)
+    
+    
   def resampleCenterline(self, polydata, spacing=0.5):
     """Resamples centerline with a spline filter to a desired spacing"""
     splineFilter = vtk.vtkSplineFilter()
@@ -506,11 +1457,12 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         extensionsFilter.SetInterpolationModeToLinear()
     elif extensionMode == "thinplatespline":
         extensionsFilter.SetInterpolationModeToThinPlateSpline()
-    #extensionsFilter.SetBoundaryIds(boundaryIds)
     extensionsFilter.Update()
     return extensionsFilter.GetOutput()
 
-  def clipVessel(self, surfacePolyData, centerlinesNode, clipPointsMarkupsNode, cap, addFlowExtensions, extensionLength, extensionMode):
+  def clipVessel(self, surfacePolyData, centerlinesNode, clipPointsMarkupsNode, cap, addFlowExtensions,
+                 extensionLength, extensionMode, manualClipPlaneNormals=None, manualClipPlaneOrigins=None,
+                 interactivePointIndex=-1, clippingMethod="Plane", sphereRadiusFactor=2.5):
     """Clips the vessel.
     :param surfacePolyData: input surface
     :param centerlinesPolyData: input centerlines
@@ -521,11 +1473,8 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     :param extensionMode: string specifying the extension mode:
     :return: polydata containing clipped vessel
     """
-    
-    import vtkvmtkComputationalGeometryPython as vtkvmtkComputationalGeometry
 
-    centerlinesPolyData = centerlinesNode.GetPolyData()
-    centerlinesPolyData = self.resampleCenterline(centerlinesPolyData, spacing=0.5)
+    centerlinesPolyData = self.getCachedCenterlineGeometry(centerlinesNode)
 
     numberOfControlPoints = clipPointsMarkupsNode.GetNumberOfControlPoints()
     if numberOfControlPoints == 0:
@@ -540,107 +1489,89 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     pos = [0.0, 0.0, 0.0]
     
     for controlPointIndex in range(numberOfControlPoints):
-        clipPointsMarkupsNode.GetNthControlPointPosition(controlPointIndex, pos)
+        clipPointsMarkupsNode.GetNthControlPointPositionWorld(controlPointIndex, pos)
         pointId = pointLocator.FindClosestPoint(pos)
-        clipPoints.append(centerlinesPolyData.GetPoint(pointId))
+        controlPointId = clipPointsMarkupsNode.GetNthControlPointID(controlPointIndex)
+        if manualClipPlaneOrigins and controlPointId in manualClipPlaneOrigins:
+            clipPoints.append(tuple(manualClipPlaneOrigins[controlPointId]))
+        else:
+            clipPoints.append(centerlinesPolyData.GetPoint(pointId))
 
-    
-    # create the centerline split extractor
-    pointSplitExtractor = vtkvmtkComputationalGeometry.vtkvmtkCenterlineSplitExtractor()
-    pointSplitExtractor.SetInputData(centerlinesPolyData)
-    pointSplitExtractor.SetRadiusArrayName(self.radiusArrayName)
-    pointSplitExtractor.SetGroupIdsArrayName(self.groupIdsArrayName)
-    pointSplitExtractor.SetTractIdsArrayName(self.tractIdsArrayName)
-    pointSplitExtractor.SetCenterlineIdsArrayName(self.centerlineIdsArrayName)
-    pointSplitExtractor.SetBlankingArrayName(self.blankingArrayName)
-    pointSplitExtractor.SetGapLength(self.gapLength)
-    pointSplitExtractor.SetTolerance(self.tolerance)    
-
-    groupIds = vtk.vtkIdList()
-    groupIds.InsertNextId(0)
-
-    surface = surfacePolyData
-    # clip with branchclipper (slightly off the clip point)
-    # clip the stub with plane (clippolydata)
-    # merge the clipped stub and the large vessel from branch clipper
+    planeSpecifications = []
+    self.lastUnclippedPoints = []
+    radiusArray = centerlinesPolyData.GetPointData().GetArray(self.radiusArrayName)
 
     for controlPointIndex in range(numberOfControlPoints):
         pointId = pointLocator.FindClosestPoint(clipPoints[controlPointIndex])
-        # set the centerline clipping point to be slightly off the clip point
-        # this is to to generate a stub which can be clipped and then merged with the main vessel
-        if controlPointIndex == 0:
-            splitPoint = centerlinesPolyData.GetPoint(pointId+1)
-            reverse = True
+        planeOrigin = clipPoints[controlPointIndex]
+        planeNormal = list(centerlinesPolyData.GetPointData().GetArray("FrenetTangent").GetTuple3(pointId))
+        controlPointId = clipPointsMarkupsNode.GetNthControlPointID(controlPointIndex)
+        if manualClipPlaneNormals and controlPointId in manualClipPlaneNormals:
+            planeNormal = list(manualClipPlaneNormals[controlPointId])
         else:
-            reverse = False
-            splitPoint = centerlinesPolyData.GetPoint(pointId-1)    
+            planeNormal = self.orientNormalTowardBranchEnd(centerlinesPolyData, planeOrigin, planeNormal)
+        vtk.vtkMath.Normalize(planeNormal)
+        planeSpecifications.append({
+            "index": controlPointIndex,
+            "label": clipPointsMarkupsNode.GetNthControlPointLabel(controlPointIndex),
+            "origin": tuple(planeOrigin),
+            "normal": tuple(planeNormal),
+            "radius": radiusArray.GetValue(pointId) if radiusArray else None,
+        })
 
-        pointSplitExtractor.SetSplitPoint(splitPoint)
-        pointSplitExtractor.Update()
-        splitCenterlines = pointSplitExtractor.GetOutput()
-        
-        # separate surface into groups based on the split centerlines
-        branchClipper = self.set_clipper(surface, splitCenterlines, groupIds)
+    def applyPlane(currentSurface, specification):
+        clippedSurface, clipped, reason = self.clipModel(currentSurface, specification["origin"], specification["normal"],
+                                                         specification.get("radius"), clippingMethod, sphereRadiusFactor)
+        if clippedSurface.GetNumberOfPoints() == 0:
+            logging.error("Plane removed the entire surface; skipping clip point %d.", specification["index"])
+            return currentSurface
+        if not clipped:
+            self.lastUnclippedPoints.append(specification["label"])
+            logging.warning("Clip point '%s' had no effect: it may be positioned exactly at, or beyond, the vessel end.",
+                            specification["label"])
+        return clippedSurface
 
-        # create a stub and surface using the clipped centerlines
-        if clipPointsMarkupsNode:
-            if controlPointIndex == 0:
-                surface = branchClipper.GetClippedOutput()
-                stub = branchClipper.GetOutput()
-            else:
-                surface = branchClipper.GetOutput()  
-                stub = branchClipper.GetClippedOutput()  
-        else:
-            surface = branchClipper.GetOutput()
+    if 0 <= interactivePointIndex < numberOfControlPoints:
+        # Cache the topology-safe prefix. Cuts after the edited endpoint must be replayed:
+        # moving a plane can change the connected regions seen by downstream cuts.
+        prefixPlaneKey = tuple(
+            (specification["index"], specification["origin"], specification["normal"])
+            for specification in planeSpecifications[:interactivePointIndex])
+        incrementalCacheKey = (
+            surfacePolyData.GetMTime(), centerlinesNode.GetPolyData().GetMTime(),
+            clipPointsMarkupsNode.GetID(), interactivePointIndex, clippingMethod, prefixPlaneKey)
+        if incrementalCacheKey != self._incrementalClipCacheKey or self._incrementalClipBaseSurface is None:
+            fixedSurface = surfacePolyData
+            for specification in planeSpecifications[:interactivePointIndex]:
+                fixedSurface = applyPlane(fixedSurface, specification)
+            self._incrementalClipBaseSurface = vtk.vtkPolyData()
+            self._incrementalClipBaseSurface.DeepCopy(fixedSurface)
+            self._incrementalClipCacheKey = incrementalCacheKey
+        surface = self._incrementalClipBaseSurface
+        for specification in planeSpecifications[interactivePointIndex:]:
+            surface = applyPlane(surface, specification)
+    else:
+        surface = surfacePolyData
+        for specification in planeSpecifications:
+            surface = applyPlane(surface, specification)
 
-        # clip the stub at the clipping point
-        cutSegment = self.clipModel(stub, centerlinesPolyData, clipPoints[controlPointIndex], reverse)
-        if cutSegment.GetNumberOfPoints() == 0:
-            logging.error("Cut segment has zero points, skipping clip point " + str(controlPointIndex) + ".")
-            continue
-        
-        # merge stub and main vessel
-        append=vtk.vtkAppendPolyData()
-        append.AddInputData(surface)
-        append.AddInputData(cutSegment)
-        append.Update()
-        clean = vtk.vtkCleanPolyData()
-        clean.SetInputData(append.GetOutput())
-        clean.Update()
-        surface = clean.GetOutput()
+    # Plane clipping does not require per-cut branch splitting, merging, or cleaning.
+    # Clean once and retain the largest connected vessel component at the end.
+    clean = vtk.vtkCleanPolyData()
+    clean.SetInputData(surface)
+    clean.Update()
+    connectFilter = vtk.vtkPolyDataConnectivityFilter()
+    connectFilter.SetInputConnection(clean.GetOutputPort())
+    connectFilter.SetExtractionModeToLargestRegion()
+    connectFilter.Update()
+    surface = connectFilter.GetOutput()
 
-        # remove any disconnected pieces
-        connectFilter = vtk.vtkPolyDataConnectivityFilter()
-        connectFilter.SetInputData(surface)
-        connectFilter.SetExtractionModeToAllRegions()
-        connectFilter.ColorRegionsOn()
-        connectFilter.Update()
-        surface = connectFilter.GetOutput()
-
-        # if the centerline does not cover the entire surface 
-        # there may be pieces that are not connected. Identify and remove them.
-        num_regions = int(surface.GetPointData().GetArray("RegionId").GetRange()[1])
-
-        if num_regions > 0:
-            # find region closest to clip point
-            locator = vtk.vtkPointLocator()
-            locator.SetDataSet(surface)
-            locator.BuildLocator()
-            closestPointId = locator.FindClosestPoint(clipPoints[controlPointIndex])
-            region_id = surface.GetPointData().GetArray("RegionId").GetValue(closestPointId)
-
-            threshold = vtk.vtkThreshold()
-            threshold.SetInputData(surface)
-            threshold.SetInputArrayToProcess(0, 0, 0, "vtkDataObject::FIELD_ASSOCIATION_POINTS", "RegionId")
-            threshold.SetLowerThreshold(region_id)
-            threshold.SetUpperThreshold(region_id)
-            threshold.Update()
-            surface = threshold.GetOutput()
-
-            geoFilter = vtk.vtkGeometryFilter()
-            geoFilter.SetInputData(surface)
-            geoFilter.Update()
-            surface = geoFilter.GetOutput()
+    self.validateClipPlanes(surface, planeSpecifications)
+    if self.lastPlanarityFailures:
+        logging.warning("Clip Vessel found non-planar boundaries; flow extension and capping were skipped: %s",
+                        ", ".join(result["label"] for result in self.lastPlanarityFailures))
+        addFlowExtensions = False
+        cap = False
 
     if addFlowExtensions:
         slicer.util.showStatusMessage("Adding extensions...")
@@ -678,4 +1609,3 @@ class ClipVesselTest(ScriptedLoadableModuleTest):
   def runTest(self):
     """
     """
-
