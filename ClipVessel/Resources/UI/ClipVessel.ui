@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>550</width>
-    <height>759</height>
+    <width>465</width>
+    <height>809</height>
    </rect>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
@@ -608,9 +608,9 @@
        </widget>
       </item>
       <item row="6" column="0">
-       <widget class="QLabel" name="label_3">
+       <widget class="QLabel" name="extensionRatioLabel">
         <property name="text">
-         <string>Extension length</string>
+         <string>Extension length ratio</string>
         </property>
         <property name="indent">
          <number>10</number>
@@ -618,41 +618,44 @@
        </widget>
       </item>
       <item row="6" column="1">
-       <widget class="ctkSliderWidget" name="extensionLengthWidget">
+       <widget class="ctkSliderWidget" name="extensionRatioWidget">
         <property name="toolTip">
-         <string>Higher values increase .</string>
+         <string>Length of each flow extension, as a multiple of the radius of the vessel end that it is attached to. For example, 2 adds an extension that is twice as long as the radius of that clipped end.</string>
         </property>
         <property name="decimals">
          <number>2</number>
         </property>
         <property name="singleStep">
-         <double>1.000000000000000</double>
+         <double>0.500000000000000</double>
         </property>
         <property name="minimum">
-         <double>1.000000000000000</double>
+         <double>0.100000000000000</double>
         </property>
         <property name="maximum">
-         <double>25.000000000000000</double>
+         <double>20.000000000000000</double>
         </property>
         <property name="value">
-         <double>5.000000000000000</double>
+         <double>2.000000000000000</double>
+        </property>
+        <property name="suffix">
+         <string> x radius</string>
         </property>
        </widget>
       </item>
       <item row="7" column="0">
-       <widget class="QLabel" name="label_3">
+       <widget class="QLabel" name="extensionModeLabel">
         <property name="text">
          <string>Extension mode</string>
         </property>
         <property name="indent">
-         <number>12</number>
+         <number>10</number>
         </property>
        </widget>
       </item>
       <item row="7" column="1">
        <widget class="QComboBox" name="extensionModeComboBox">
         <property name="toolTip">
-         <string>Mode for adding flow extension</string>
+         <string>Direction in which the flow extension is added: along the direction of the centerline at the vessel end, or along the normal of the clipped boundary.</string>
         </property>
         <property name="editable">
          <bool>false</bool>
@@ -660,13 +663,65 @@
        </widget>
       </item>
       <item row="8" column="0">
+       <widget class="QLabel" name="interpolationModeLabel">
+        <property name="text">
+         <string>Interpolation mode</string>
+        </property>
+        <property name="indent">
+         <number>10</number>
+        </property>
+       </widget>
+      </item>
+      <item row="8" column="1">
+       <widget class="QComboBox" name="interpolationModeComboBox">
+        <property name="toolTip">
+         <string>How the original vessel cross-section is blended into the circular cross-section of the extension. Linear switches to the circular cross-section immediately; thin plate spline blends the two gradually, controlled by the transition length ratio and stiffness below.</string>
+        </property>
+        <property name="editable">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="9" column="0">
+       <widget class="QLabel" name="transitionRatioLabel">
+        <property name="text">
+         <string>Transition length ratio</string>
+        </property>
+        <property name="indent">
+         <number>10</number>
+        </property>
+       </widget>
+      </item>
+      <item row="9" column="1">
+       <widget class="ctkSliderWidget" name="transitionRatioWidget">
+        <property name="toolTip">
+         <string>Length of the transition from the original vessel cross-section to a circular cross-section, as a fraction of the extension length. 0 makes the extension circular right from the clipped boundary; 1 spreads the transition over the entire extension. Only used by the thin plate spline interpolation mode.</string>
+        </property>
+        <property name="decimals">
+         <number>2</number>
+        </property>
+        <property name="singleStep">
+         <double>0.050000000000000</double>
+        </property>
+        <property name="minimum">
+         <double>0.000000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>1.000000000000000</double>
+        </property>
+        <property name="value">
+         <double>0.250000000000000</double>
+        </property>
+       </widget>
+      </item>
+      <item row="10" column="0">
        <widget class="QLabel" name="label_4">
         <property name="text">
          <string>Preprocess input surface:</string>
         </property>
        </widget>
       </item>
-      <item row="8" column="1">
+      <item row="10" column="1">
        <widget class="QCheckBox" name="preprocessInputSurfaceModelCheckBox">
         <property name="toolTip">
          <string>Input surface model is reduced to the requested target point count (making computation faster), or subdivided (to make computations more accurate).</string>
@@ -679,7 +734,7 @@
         </property>
        </widget>
       </item>
-      <item row="9" column="0">
+      <item row="11" column="0">
        <widget class="QLabel" name="label_3">
         <property name="text">
          <string>Target point count:</string>
@@ -689,7 +744,7 @@
         </property>
        </widget>
       </item>
-      <item row="9" column="1">
+      <item row="11" column="1">
        <widget class="ctkSliderWidget" name="targetKPointCountWidget">
         <property name="toolTip">
          <string>Preferred number of points in the preprocessed surface.</string>
@@ -714,7 +769,7 @@
         </property>
        </widget>
       </item>
-      <item row="10" column="0">
+      <item row="12" column="0">
        <widget class="QLabel" name="label_5">
         <property name="text">
          <string>Decimation aggressiveness:</string>
@@ -724,7 +779,7 @@
         </property>
        </widget>
       </item>
-      <item row="10" column="1">
+      <item row="12" column="1">
        <widget class="ctkSliderWidget" name="decimationAggressivenessWidget">
         <property name="toolTip">
          <string>Lower values preserve the mesh integrity better but it may not be possible to reduce number of points to the desired level.</string>
@@ -746,7 +801,7 @@
         </property>
        </widget>
       </item>
-      <item row="11" column="0">
+      <item row="13" column="0">
        <widget class="QLabel" name="label_6">
         <property name="text">
          <string>Subdivide:</string>
@@ -756,7 +811,7 @@
         </property>
        </widget>
       </item>
-      <item row="11" column="1">
+      <item row="13" column="1">
        <widget class="QCheckBox" name="subdivideInputSurfaceModelCheckBox">
         <property name="toolTip">
          <string>Subdivide the mesh to make computation more accurate (at the cost of increased computation time).</string>
@@ -766,7 +821,7 @@
         </property>
        </widget>
       </item>
-      <item row="12" column="0">
+      <item row="14" column="0">
        <widget class="QLabel" name="label_8">
         <property name="text">
          <string>Output preprocessed surface:</string>
@@ -776,7 +831,7 @@
         </property>
        </widget>
       </item>
-      <item row="12" column="1">
+      <item row="14" column="1">
        <widget class="qMRMLNodeComboBox" name="outputPreprocessedSurfaceModelSelector">
         <property name="toolTip">
          <string>Save preprocessing result. Useful for quality checks and for making repeated computations faster: preprocessed surface can be used as input surface (and &quot;Preprocess input surface&quot; option can then be disabled).</string>

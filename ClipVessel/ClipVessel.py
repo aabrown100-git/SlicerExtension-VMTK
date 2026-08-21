@@ -11,15 +11,21 @@ import vtkvmtkComputationalGeometryPython as vtkvmtkComputationalGeometry
 
 # Older scenes stored lowercase keywords in the parameter node; map those legacy values
 # to the current identifiers when reading.
-_LEGACY_EXTENSION_MODE_IDS = {
+_LEGACY_MODE_IDS = {
     "centerlinedirection": "CENTERLINE_DIRECTION",
     "boundarynormal": "BOUNDARY_NORMAL",
     "linear": "LINEAR",
     "thinplatespline": "THIN_PLATE_SPLINE",
 }
 
-def _normalizedExtensionMode(value):
-    return _LEGACY_EXTENSION_MODE_IDS.get(value, value)
+# Direction of the flow extension and the interpolation that blends the clipped cross-section
+# into the circular cross-section of the extension are independent settings of the flow
+# extensions filter (earlier module versions offered them in a single list).
+_EXTENSION_MODE_IDS = ("CENTERLINE_DIRECTION", "BOUNDARY_NORMAL")
+_INTERPOLATION_MODE_IDS = ("LINEAR", "THIN_PLATE_SPLINE")
+
+def _normalizedModeId(value):
+    return _LEGACY_MODE_IDS.get(value, value)
 
 """
   ClipVessel
@@ -128,16 +134,19 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.subdivideInputSurfaceModelCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
     self.ui.targetKPointCountWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
     self.ui.decimationAggressivenessWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
-    self.ui.extensionLengthWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
+    self.ui.extensionRatioWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
+    self.ui.transitionRatioWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
     self.ui.inputSegmentSelectorWidget.connect('currentSegmentChanged(QString)', self.updateParameterNodeFromGUI)
     # Combobox item data holds a stable, non-translated identifier that is stored in the
     # parameter node (and used by the logic); only the displayed item text is translatable.
+    # The current items are selected from the parameter node by updateGUIFromParameterNode
+    # (called at the end of this method), therefore no initial index is set here.
     self.ui.extensionModeComboBox.addItem(_("Centerline direction"), "CENTERLINE_DIRECTION")
     self.ui.extensionModeComboBox.addItem(_("Boundary normal"), "BOUNDARY_NORMAL")
-    self.ui.extensionModeComboBox.addItem(_("Linear"), "LINEAR")
-    self.ui.extensionModeComboBox.addItem(_("Thin plate spline"), "THIN_PLATE_SPLINE")
     self.ui.extensionModeComboBox.connect('currentIndexChanged(int)', self.updateParameterNodeFromGUI)
-    self.ui.extensionModeComboBox.setCurrentIndex(1)
+    self.ui.interpolationModeComboBox.addItem(_("Linear"), "LINEAR")
+    self.ui.interpolationModeComboBox.addItem(_("Thin plate spline"), "THIN_PLATE_SPLINE")
+    self.ui.interpolationModeComboBox.connect('currentIndexChanged(int)', self.updateParameterNodeFromGUI)
     self.ui.clipPointInsetFactorWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
     self.ui.clippingMethodComboBox.addItem(_("Plane"), "PLANE")
     self.ui.clippingMethodComboBox.addItem(_("Plane + sphere"), "PLANE_SPHERE")
@@ -279,10 +288,19 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.subdivideInputSurfaceModelCheckBox.checked = (self._parameterNode.GetParameter("SubdivideInputSurface") == "true")
     self.ui.capOutputSurfaceModelCheckBox.checked = (self._parameterNode.GetParameter("CapOutputSurface") == "true")    
     self.ui.addFlowExtensionsCheckBox.checked = (self._parameterNode.GetParameter("ExtendOutputSurface") == "true")    
-    self.ui.extensionLengthWidget.value = float(self._parameterNode.GetParameter("ExtensionLength"))
-    extensionModeIndex = self.ui.extensionModeComboBox.findData(_normalizedExtensionMode(self._parameterNode.GetParameter("ExtensionMode")))
+    self.ui.extensionRatioWidget.value = float(self._parameterNode.GetParameter("ExtensionRatio"))
+    self.ui.transitionRatioWidget.value = float(self._parameterNode.GetParameter("ExtensionTransitionRatio"))
+    extensionModeIndex = self.ui.extensionModeComboBox.findData(_normalizedModeId(self._parameterNode.GetParameter("ExtensionMode")))
     if extensionModeIndex >= 0:
         self.ui.extensionModeComboBox.currentIndex = extensionModeIndex
+    interpolationMode = _normalizedModeId(self._parameterNode.GetParameter("InterpolationMode"))
+    interpolationModeIndex = self.ui.interpolationModeComboBox.findData(interpolationMode)
+    if interpolationModeIndex >= 0:
+        self.ui.interpolationModeComboBox.currentIndex = interpolationModeIndex
+    # Transition length and stiffness only affect the thin plate spline interpolation
+    thinPlateSplineInterpolation = (interpolationMode == "THIN_PLATE_SPLINE")
+    self.ui.transitionRatioLabel.enabled = thinPlateSplineInterpolation
+    self.ui.transitionRatioWidget.enabled = thinPlateSplineInterpolation
     autoApply = self._parameterNode.GetParameter("AutoApplyPlane") == "true"
     self.ui.applyButton.checkable = autoApply
     self.ui.applyButton.checked = autoApply
@@ -380,12 +398,16 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     parameterNode.SetParameter("SubdivideInputSurface", "true" if self.ui.subdivideInputSurfaceModelCheckBox.checked else "false")
     parameterNode.SetParameter("CapOutputSurface", "true" if self.ui.capOutputSurfaceModelCheckBox.checked else "false")
     parameterNode.SetParameter("ExtendOutputSurface", "true" if self.ui.addFlowExtensionsCheckBox.checked else "false")
-    parameterNode.SetParameter("ExtensionLength", str(self.ui.extensionLengthWidget.value))
+    parameterNode.SetParameter("ExtensionRatio", str(self.ui.extensionRatioWidget.value))
+    parameterNode.SetParameter("ExtensionTransitionRatio", str(self.ui.transitionRatioWidget.value))
     # currentData is None while the combobox is still empty (during widget setup); skip the
     # write instead of passing None to SetParameter.
     extensionMode = self.ui.extensionModeComboBox.currentData
     if extensionMode:
         parameterNode.SetParameter("ExtensionMode", extensionMode)
+    interpolationMode = self.ui.interpolationModeComboBox.currentData
+    if interpolationMode:
+        parameterNode.SetParameter("InterpolationMode", interpolationMode)
     parameterNode.SetParameter("AutoApplyPlane", "true" if self.ui.applyButton.checked else "false")
     parameterNode.SetParameter("ClipPointInsetFactor", str(self.ui.clipPointInsetFactorWidget.value))
     parameterNode.SetParameter("SnapClipPointsToCenterline", "true" if self.ui.snapClipPointsToCenterlineCheckBox.checked else "false")
@@ -1085,14 +1107,16 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         clipPointsMarkupsNode = self._parameterNode.GetNodeReference("ClipPoints")
         centerlinesModelNode = self._parameterNode.GetNodeReference("InputCenterlines")
         outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel")
-        extensionLength = float(self._parameterNode.GetParameter("ExtensionLength"))
+        extensionRatio = float(self._parameterNode.GetParameter("ExtensionRatio"))
+        transitionRatio = float(self._parameterNode.GetParameter("ExtensionTransitionRatio"))
         self.saveManualPlaneNormals()
 
         # Read processing options from the parameter node. The GUI may still be
         # synchronizing after a saved scene is restored.
         cap = self._parameterNode.GetParameter("CapOutputSurface") == "true"
         addFlowExtensions = self._parameterNode.GetParameter("ExtendOutputSurface") == "true"
-        extensionMode = _normalizedExtensionMode(self._parameterNode.GetParameter("ExtensionMode"))
+        extensionMode = _normalizedModeId(self._parameterNode.GetParameter("ExtensionMode"))
+        interpolationMode = _normalizedModeId(self._parameterNode.GetParameter("InterpolationMode"))
         clippingMethod = self._parameterNode.GetParameter("ClippingMethod") or "PLANE_PATCH"
         sphereRadiusFactor = float(self._parameterNode.GetParameter("LocalSphereRadiusFactor"))
 
@@ -1100,9 +1124,10 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         slicer.app.processEvents()  # force update
 
         outputPolyData = self.logic.clipVessel(preprocessedPolyData, centerlinesModelNode, clipPointsMarkupsNode,
-                                               cap, addFlowExtensions, extensionLength, extensionMode,
+                                               cap, addFlowExtensions, extensionRatio, extensionMode,
                                                self._manualPlaneNormals, self._manualPlaneOrigins,
-                                               self._activeClipPointIndex, clippingMethod, sphereRadiusFactor)
+                                               self._activeClipPointIndex, clippingMethod, sphereRadiusFactor,
+                                               transitionRatio, interpolationMode)
 
         outputModelNode.SetAndObserveMesh(outputPolyData)
         if not outputModelNode.GetDisplayNode():
@@ -1149,15 +1174,28 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
   def __init__(self):
     ScriptedLoadableModuleLogic.__init__(self)
     self.radiusArrayName = 'Radius'
-    self.Sigma = 1
-    self.AdaptiveExtensionLength = 0
-    self.AdaptiveExtensionRadius = 1
-    self.AdaptiveNumberOfBoundaryPoints = 0
-    self.ExtensionRatio = 2
+
+    # whether to use an adaptive extension length, expressed as a multiple of the boundary's mean radius
+    self.AdaptiveExtensionLength = True
+    # length of the extension, expressed as a multiple of the boundary's mean radius, used when AdaptiveExtensionLength is on
+    self.ExtensionRatio = 2.0
+    # length of the extension in mm, used when AdaptiveExtensionLength is off
+    self.ExtensionLength = 5.0
+
+    # whether to use an adaptive number of boundary points
+    self.AdaptiveNumberOfBoundaryPoints = True
+    # used when AdaptiveNumberOfBoundaryPoints is off
+    self.TargetNumberOfBoundaryPoints = 50
+    
+    # whether to use an adaptive extension radius, expressed as a multiple of the boundary's mean radius
+    self.AdaptiveExtensionRadius = True
+    # used when AdaptiveExtensionRadius is off
     self.ExtensionRadius = 1
+
+    # Length of the transition from the original cross-section to a circular one,
+    # as a fraction of the extension length. Used when the caller does not specify one.
     self.TransitionRatio = 0.25
     self.CenterlineNormalEstimationDistanceRatio = 1.0
-    self.TargetNumberOfBoundaryPoints = 50
 
     self.planarityToleranceMm = 0.01
     self.lastPlanarityResults = []
@@ -1186,8 +1224,25 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         parameterNode.SetParameter("SubdivideInputSurface", "false")
     if not parameterNode.GetParameter("CapOutputSurface"):
         parameterNode.SetParameter("CapOutputSurface", "true")
-    if not parameterNode.GetParameter("ExtensionLength"):
-        parameterNode.SetParameter("ExtensionLength", "5")
+    if not parameterNode.GetParameter("ExtensionRatio"):
+        parameterNode.SetParameter("ExtensionRatio", "2")
+    if not parameterNode.GetParameter("ExtensionTransitionRatio"):
+        parameterNode.SetParameter("ExtensionTransitionRatio", "0.25")
+    # Earlier module versions offered the extension direction and the interpolation method in
+    # a single list, storing both in the ExtensionMode parameter. When an interpolation method
+    # was chosen there, the extension direction was left at the filter default (centerline
+    # direction), so scenes saved that way are migrated accordingly.
+    extensionMode = _normalizedModeId(parameterNode.GetParameter("ExtensionMode"))
+    interpolationMode = _normalizedModeId(parameterNode.GetParameter("InterpolationMode"))
+    if extensionMode in _INTERPOLATION_MODE_IDS:
+        interpolationMode = extensionMode
+        extensionMode = "CENTERLINE_DIRECTION"
+    extensionMode = extensionMode if extensionMode in _EXTENSION_MODE_IDS else "BOUNDARY_NORMAL"
+    interpolationMode = interpolationMode if interpolationMode in _INTERPOLATION_MODE_IDS else "THIN_PLATE_SPLINE"
+    if extensionMode != parameterNode.GetParameter("ExtensionMode"):
+        parameterNode.SetParameter("ExtensionMode", extensionMode)
+    if interpolationMode != parameterNode.GetParameter("InterpolationMode"):
+        parameterNode.SetParameter("InterpolationMode", interpolationMode)
     if not parameterNode.GetParameter("ManualClipPlaneNormals"):
         parameterNode.SetParameter("ManualClipPlaneNormals", "{}")
     if not parameterNode.GetParameter("ManualClipPlaneOrigins"):
@@ -1742,44 +1797,64 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     polydata = splineFilter.GetOutput()
     return polydata
         
-  def extendVessel(self, surfacePolyData, centerlinesPolyData, extensionLength, extensionMode):
-    """Adds flow extensions to all boundaries"""
+  def extendVessel(self, surfacePolyData, centerlinesPolyData, extensionRatio, extensionMode,
+                   transitionRatio=None, interpolationMode=None):
+    """Adds flow extensions to all boundaries.
+    :param extensionRatio: length of each extension, as a multiple of the mean radius of the
+      boundary that it is attached to. Defaults to self.ExtensionRatio.
+    :param extensionMode: direction of the extension ("CENTERLINE_DIRECTION" or "BOUNDARY_NORMAL")
+    :param transitionRatio: length of the transition from the original cross-section to a circular
+      one, as a fraction of the extension length (0..1). Defaults to self.TransitionRatio.
+      Only used by the thin plate spline interpolation.
+    :param interpolationMode: blending of the original cross-section into the circular one
+      ("LINEAR" or "THIN_PLATE_SPLINE"); None keeps the filter default (thin plate spline).
+    """
+    if extensionRatio is None:
+        extensionRatio = self.ExtensionRatio
+    if transitionRatio is None:
+        transitionRatio = self.TransitionRatio
+    transitionRatio = min(max(float(transitionRatio), 0.0), 1.0)
     
     extensionsFilter = vtkvmtkComputationalGeometry.vtkvmtkPolyDataFlowExtensionsFilter()
     extensionsFilter.SetInputData(surfacePolyData)
     extensionsFilter.SetCenterlines(centerlinesPolyData)
-    extensionsFilter.SetSigma(self.Sigma)
     extensionsFilter.SetAdaptiveExtensionLength(self.AdaptiveExtensionLength)
     extensionsFilter.SetAdaptiveExtensionRadius(self.AdaptiveExtensionRadius)
     extensionsFilter.SetAdaptiveNumberOfBoundaryPoints(self.AdaptiveNumberOfBoundaryPoints)
-    extensionsFilter.SetExtensionLength(extensionLength)
-    extensionsFilter.SetExtensionRatio(self.ExtensionRatio)
+    extensionsFilter.SetExtensionLength(self.ExtensionLength)
+    extensionsFilter.SetExtensionRatio(float(extensionRatio))
     extensionsFilter.SetExtensionRadius(self.ExtensionRadius)
-    extensionsFilter.SetTransitionRatio(self.TransitionRatio)
+    extensionsFilter.SetTransitionRatio(transitionRatio)
     extensionsFilter.SetCenterlineNormalEstimationDistanceRatio(self.CenterlineNormalEstimationDistanceRatio)
     extensionsFilter.SetNumberOfBoundaryPoints(self.TargetNumberOfBoundaryPoints)
     if extensionMode == "CENTERLINE_DIRECTION":
         extensionsFilter.SetExtensionModeToUseCenterlineDirection()
     elif extensionMode == "BOUNDARY_NORMAL":
         extensionsFilter.SetExtensionModeToUseNormalToBoundary()
-    if extensionMode == "LINEAR":
+    if interpolationMode == "LINEAR":
         extensionsFilter.SetInterpolationModeToLinear()
-    elif extensionMode == "THIN_PLATE_SPLINE":
+    elif interpolationMode == "THIN_PLATE_SPLINE":
         extensionsFilter.SetInterpolationModeToThinPlateSpline()
     extensionsFilter.Update()
     return extensionsFilter.GetOutput()
 
   def clipVessel(self, surfacePolyData, centerlinesNode, clipPointsMarkupsNode, cap, addFlowExtensions,
-                 extensionLength, extensionMode, manualClipPlaneNormals=None, manualClipPlaneOrigins=None,
-                 interactivePointIndex=-1, clippingMethod="PLANE_PATCH", sphereRadiusFactor=2.5):
+                 extensionRatio, extensionMode, manualClipPlaneNormals=None, manualClipPlaneOrigins=None,
+                 interactivePointIndex=-1, clippingMethod="PLANE_PATCH", sphereRadiusFactor=2.5,
+                 transitionRatio=None, interpolationMode=None):
     """Clips the vessel.
     :param surfacePolyData: input surface
     :param centerlinesPolyData: input centerlines
     :param clipPointsMarkupsNode: markup node containing clip points
     :param cap: flag indicating whether to cap the model:
     :param addFlowExtensions: flag indicating whether to add flow extensions:
-    :param extensionLength: float value specifying the extension length:
+    :param extensionRatio: length of each flow extension, as a multiple of the radius of the
+      vessel end that it is attached to; None uses the logic default
     :param extensionMode: string specifying the extension mode:
+    :param transitionRatio: length of the flow extension transition (original cross-section to
+      circular) as a fraction of the extension length; None uses the logic default
+    :param interpolationMode: string specifying how the original cross-section is blended into
+      the circular one ("LINEAR" or "THIN_PLATE_SPLINE"); None uses the filter default
     :return: polydata containing clipped vessel
     """
 
@@ -1885,7 +1960,8 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     if addFlowExtensions:
         slicer.util.showStatusMessage(_("Adding extensions..."))
         slicer.app.processEvents() 
-        surface = self.extendVessel(surface, centerlinesPolyData, extensionLength, extensionMode)
+        surface = self.extendVessel(surface, centerlinesPolyData, extensionRatio, extensionMode,
+                                    transitionRatio, interpolationMode)
 
     # Cap all the holes that are in the surface
     if cap:
@@ -1981,14 +2057,16 @@ class ClipVesselTest(ScriptedLoadableModuleTest):
     # Compute the clipped vessel
     cap = True
     addFlowExtensions = False
-    extensionLength = 5.0
+    extensionRatio = 2.0
     extensionMode = "BOUNDARY_NORMAL"
+    transitionRatio = 0.5
+    interpolationMode = "THIN_PLATE_SPLINE"
 
     # Clip with all clipping methods, each into its own output model node
     for clippingMethod in ["PLANE", "PLANE_SPHERE", "PLANE_PATCH", "BOX"]:
         self.delayDisplay("Clipping vessel (%s)" % clippingMethod)
         outputPolyData = clipVesselLogic.clipVessel(preprocessedPolyData, centerlineModelNode, clipPointsMarkupsNode,
-                                                    cap, addFlowExtensions, extensionLength, extensionMode,
+                                                    cap, addFlowExtensions, extensionRatio, extensionMode,
                                                     clippingMethod=clippingMethod)
         self.assertIsNotNone(outputPolyData)
         self.assertGreater(outputPolyData.GetNumberOfCells(), 0)
@@ -2015,7 +2093,9 @@ class ClipVesselTest(ScriptedLoadableModuleTest):
     # One more clipping with flow extensions added to the open vessel ends
     self.delayDisplay("Clipping vessel with flow extensions")
     extendedPolyData = clipVesselLogic.clipVessel(preprocessedPolyData, centerlineModelNode, clipPointsMarkupsNode,
-                                                  cap, True, extensionLength, extensionMode)
+                                                  cap, True, extensionRatio, extensionMode,
+                                                  transitionRatio=transitionRatio,
+                                                  interpolationMode=interpolationMode)
     self.assertIsNotNone(extendedPolyData)
     self.assertGreater(extendedPolyData.GetNumberOfCells(), 0)
     self.assertEqual(clipVesselLogic.lastUnclippedPoints, [])
