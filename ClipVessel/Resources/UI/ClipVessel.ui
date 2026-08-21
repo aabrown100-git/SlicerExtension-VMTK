@@ -675,7 +675,7 @@
       <item row="8" column="1">
        <widget class="QComboBox" name="interpolationModeComboBox">
         <property name="toolTip">
-         <string>How the original vessel cross-section is blended into the circular cross-section of the extension. Linear switches to the circular cross-section immediately; thin plate spline blends the two gradually, controlled by the transition length ratio and stiffness below.</string>
+         <string>How the original vessel cross-section is blended into the circular cross-section of the extension, over the transition length set below. Ramp fades the two into each other with a smooth curve that is flat at both ends, so the extension leaves the clipped boundary and settles into the circular tube without a crease; linear fades them at a constant rate; thin plate spline warps the transition instead, which loses the finer features of a non-circular cross-section within the first few layers of the extension.</string>
         </property>
         <property name="editable">
          <bool>false</bool>
@@ -695,7 +695,7 @@
       <item row="9" column="1">
        <widget class="ctkSliderWidget" name="transitionRatioWidget">
         <property name="toolTip">
-         <string>Length of the transition from the original vessel cross-section to a circular cross-section, as a fraction of the extension length. 0 makes the extension circular right from the clipped boundary; 1 spreads the transition over the entire extension. Only used by the thin plate spline interpolation mode.</string>
+         <string>Length of the transition from the original vessel cross-section to a circular cross-section, as a fraction of the extension length. 0 makes the extension circular right from the clipped boundary; 1 spreads the transition over the entire extension.</string>
         </property>
         <property name="decimals">
          <number>2</number>
@@ -715,13 +715,36 @@
        </widget>
       </item>
       <item row="10" column="0">
+       <widget class="QLabel" name="preserveCrossSectionShapeLabel">
+        <property name="text">
+         <string>Preserve cross-section shape</string>
+        </property>
+        <property name="indent">
+         <number>10</number>
+        </property>
+       </widget>
+      </item>
+      <item row="10" column="1">
+       <widget class="QCheckBox" name="preserveCrossSectionShapeCheckBox">
+        <property name="toolTip">
+         <string>Keep the cross-sectional shape of the clipped vessel end along the whole extension, instead of morphing it into a circle. The outline of the clipped end is used as it is, so the area distribution of a non-circular end is not altered. A strongly concave end may be hard to cap.</string>
+        </property>
+        <property name="text">
+         <string/>
+        </property>
+        <property name="checked">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="11" column="0">
        <widget class="QLabel" name="label_4">
         <property name="text">
          <string>Preprocess input surface:</string>
         </property>
        </widget>
       </item>
-      <item row="10" column="1">
+      <item row="11" column="1">
        <widget class="QCheckBox" name="preprocessInputSurfaceModelCheckBox">
         <property name="toolTip">
          <string>Input surface model is reduced to the requested target point count (making computation faster), or subdivided (to make computations more accurate).</string>
@@ -734,7 +757,7 @@
         </property>
        </widget>
       </item>
-      <item row="11" column="0">
+      <item row="12" column="0">
        <widget class="QLabel" name="label_3">
         <property name="text">
          <string>Target point count:</string>
@@ -744,7 +767,7 @@
         </property>
        </widget>
       </item>
-      <item row="11" column="1">
+      <item row="12" column="1">
        <widget class="ctkSliderWidget" name="targetKPointCountWidget">
         <property name="toolTip">
          <string>Preferred number of points in the preprocessed surface.</string>
@@ -769,7 +792,7 @@
         </property>
        </widget>
       </item>
-      <item row="12" column="0">
+      <item row="13" column="0">
        <widget class="QLabel" name="label_5">
         <property name="text">
          <string>Decimation aggressiveness:</string>
@@ -779,7 +802,7 @@
         </property>
        </widget>
       </item>
-      <item row="12" column="1">
+      <item row="13" column="1">
        <widget class="ctkSliderWidget" name="decimationAggressivenessWidget">
         <property name="toolTip">
          <string>Lower values preserve the mesh integrity better but it may not be possible to reduce number of points to the desired level.</string>
@@ -801,7 +824,7 @@
         </property>
        </widget>
       </item>
-      <item row="13" column="0">
+      <item row="14" column="0">
        <widget class="QLabel" name="label_6">
         <property name="text">
          <string>Subdivide:</string>
@@ -811,7 +834,7 @@
         </property>
        </widget>
       </item>
-      <item row="13" column="1">
+      <item row="14" column="1">
        <widget class="QCheckBox" name="subdivideInputSurfaceModelCheckBox">
         <property name="toolTip">
          <string>Subdivide the mesh to make computation more accurate (at the cost of increased computation time).</string>
@@ -821,7 +844,7 @@
         </property>
        </widget>
       </item>
-      <item row="14" column="0">
+      <item row="15" column="0">
        <widget class="QLabel" name="label_8">
         <property name="text">
          <string>Output preprocessed surface:</string>
@@ -831,7 +854,7 @@
         </property>
        </widget>
       </item>
-      <item row="14" column="1">
+      <item row="15" column="1">
        <widget class="qMRMLNodeComboBox" name="outputPreprocessedSurfaceModelSelector">
         <property name="toolTip">
          <string>Save preprocessing result. Useful for quality checks and for making repeated computations faster: preprocessed surface can be used as input surface (and &quot;Preprocess input surface&quot; option can then be disabled).</string>
