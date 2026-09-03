@@ -1,31 +1,62 @@
+import colorsys
 import json
 import logging
 import vtk, qt, slicer
 from slicer.i18n import tr as _
 from slicer.i18n import translate
 import numpy as np
-from vtk.util.numpy_support import vtk_to_numpy
+from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 import vtkvmtkComputationalGeometryPython as vtkvmtkComputationalGeometry
 
 # Older scenes stored lowercase keywords in the parameter node; map those legacy values
 # to the current identifiers when reading.
-_LEGACY_MODE_IDS = {
+_LEGACY_OPTION_IDS = {
     "centerlinedirection": "CENTERLINE_DIRECTION",
     "boundarynormal": "BOUNDARY_NORMAL",
     "linear": "LINEAR",
     "thinplatespline": "THIN_PLATE_SPLINE",
 }
 
-# Direction of the flow extension and the interpolation that blends the clipped cross-section
-# into the target cross-section of the extension are independent settings of the flow
-# extensions filter (earlier module versions offered them in a single list).
-_EXTENSION_MODE_IDS = ("CENTERLINE_DIRECTION", "BOUNDARY_NORMAL")
-_INTERPOLATION_MODE_IDS = ("LINEAR", "THIN_PLATE_SPLINE", "RAMP")
+# The direction of the flow extension and the method that transitions the clipped
+# cross-section into the target cross-section of the extension are independent settings of the
+# flow extensions filter (earlier module versions offered them in a single list).
+_EXTENSION_DIRECTION_IDS = ("CENTERLINE_DIRECTION", "BOUNDARY_NORMAL")
+_TRANSITION_METHOD_IDS = ("LINEAR", "THIN_PLATE_SPLINE", "RAMP")
 
-def _normalizedModeId(value):
-    return _LEGACY_MODE_IDS.get(value, value)
+# Name of the cell data array that the optional face labeling writes the per-face ids into.
+# "ModelFaceID" is the name SimVascular and its meshing tools read the faces of a model by.
+_DEFAULT_MODEL_FACE_ID_ARRAY_NAME = "ModelFaceID"
+
+# Shape of the mesh that closes a clipped end, one VMTK capping filter each (the methods of the
+# vmtksurfacecapper script that apply to a surface with single, unpaired open boundaries).
+_CAP_METHOD_IDS = ("CENTERPOINT", "SIMPLE", "SMOOTH")
+_DEFAULT_CAP_METHOD = "CENTERPOINT"
+# Neither the simple nor the smooth capper triangulates what it makes - the first fills a
+# boundary with one polygon, the second with rings of quads - and the smooth one reads its input
+# as triangles.
+_CAP_METHODS_NEEDING_TRIANGLES = ("SIMPLE", "SMOOTH")
+# Bulge of a smooth cap out of the plane of the cut, as a fraction of an eighth of the diagonal
+# of the boundary. 0 keeps the cap in the plane of the cut, which is what the other two methods
+# do, so that switching to smooth only changes how the cap is meshed and not where it sits.
+_DEFAULT_CAP_CONSTRAINT_FACTOR = 0.0
+_DEFAULT_CAP_NUMBER_OF_RINGS = 8
+# Edge length a uniform cap mesh is remeshed to, in mm. 0 sizes each cap after the surface
+# around its own rim, so that caps come out meshed as finely as the vessel they close.
+_DEFAULT_CAP_TARGET_EDGE_LENGTH = 0.0
+
+def _normalizedOptionId(value):
+    return _LEGACY_OPTION_IDS.get(value, value)
+
+
+def _faceColor(faceId, isWall):
+    """Color for a face id: neutral grey for the wall, otherwise a hue spaced by the golden
+    angle so that any number of faces stay far apart. The hue follows the id, so renumbering a
+    face also changes its color."""
+    if isWall:
+        return (0.78, 0.78, 0.81)
+    return colorsys.hsv_to_rgb((faceId * 0.6180339887498949) % 1.0, 0.62, 0.95)
 
 """
   ClipVessel
@@ -72,6 +103,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self._observedInteractivePlaneNode = None
     self._observedNormalHandleNode = None
     self._activeClipPointIndex = -1
+    self._activeClipPointId = None
     self._updatingInteractivePlane = False
     self._manualPlaneNormals = {}
     self._manualPlaneOrigins = {}
@@ -95,6 +127,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     uiWidget = slicer.util.loadUI(self.resourcePath('UI/ClipVessel.ui'))
     self.layout.addWidget(uiWidget)
     self.ui = slicer.util.childWidgetVariables(uiWidget)
+    # Kept so that cleanup() can hand the scene back (see there).
 
     self.nodeSelectors = [
         (self.ui.inputSurfaceSelector, "InputSurface"),
@@ -123,13 +156,36 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         (self.ui.toggleClipPointsVisibilityButton, "ClipPoints", _("clip points")),
     ]
 
+    # A tool button asks for a taller box than the node selector beside it - it sizes itself
+    # around its icon - so a row comes out ragged, the selector sitting lower than the buttons at
+    # its right. The height to keep is the selector's, and the buttons are held to it, their icons
+    # scaled to what is left inside once the frame has taken its share. Asked of the widgets
+    # rather than written down as a number, so that it stays right whatever the font size, the
+    # style and the screen make of them.
+    rowHeight = self.ui.outputSurfaceModelSelector.sizeHint.height()
+    rowButtons = [button for button, _role, _name in self.inputVisibilityButtons]
+    rowButtons += [self.ui.toggleOutputEdgesButton, self.ui.toggleOutputVisibilityButton]
+    for button in rowButtons:
+        button.setFixedHeight(rowHeight)
+        button.setIconSize(qt.QSize(rowHeight - 8, rowHeight - 8))
+
     self.setParameterNode(self.logic.getParameterNode())
 
     # Connections
     self.ui.capOutputSurfaceModelCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
+    self.ui.capMethodComboBox.addItem(_("Center point"), "CENTERPOINT")
+    self.ui.capMethodComboBox.addItem(_("Simple"), "SIMPLE")
+    self.ui.capMethodComboBox.addItem(_("Smooth"), "SMOOTH")
+    self.ui.capMethodComboBox.connect('currentIndexChanged(int)', self.updateParameterNodeFromGUI)
+    self.ui.capConstraintFactorWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
+    self.ui.capNumberOfRingsWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
+    self.ui.remeshCapsCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
+    self.ui.capTargetEdgeLengthWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
+    self.ui.labelModelFacesCheckBox.connect("toggled(bool)", self.onLabelModelFacesToggled)
+    self.ui.modelFaceIdArrayNameLineEdit.connect("editingFinished()", self.onModelFaceIdArrayNameEditingFinished)
     self.ui.addFlowExtensionsCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
     self.ui.parameterNodeSelector.connect('currentNodeChanged(vtkMRMLNode*)', self.setParameterNode)
-    self.ui.applyButton.connect('clicked(bool)', self.onApplyButton)
+    self.ui.applyButton.connect('clicked(bool)', self.onApplyButtonClicked)
     self.ui.applyButton.connect('checkBoxToggled(bool)', self.updateParameterNodeFromGUI)
     self.ui.preprocessInputSurfaceModelCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
     self.ui.subdivideInputSurfaceModelCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
@@ -142,14 +198,14 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # parameter node (and used by the logic); only the displayed item text is translatable.
     # The current items are selected from the parameter node by updateGUIFromParameterNode
     # (called at the end of this method), therefore no initial index is set here.
-    self.ui.extensionModeComboBox.addItem(_("Centerline direction"), "CENTERLINE_DIRECTION")
-    self.ui.extensionModeComboBox.addItem(_("Boundary normal"), "BOUNDARY_NORMAL")
-    self.ui.extensionModeComboBox.connect('currentIndexChanged(int)', self.updateParameterNodeFromGUI)
-    self.ui.interpolationModeComboBox.addItem(_("Linear"), "LINEAR")
-    self.ui.interpolationModeComboBox.addItem(_("Thin plate spline"), "THIN_PLATE_SPLINE")
-    self.ui.interpolationModeComboBox.addItem(_("Ramp"), "RAMP")
-    self.ui.interpolationModeComboBox.connect('currentIndexChanged(int)', self.updateParameterNodeFromGUI)
-    self.ui.preserveCrossSectionShapeCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
+    self.ui.extensionDirectionComboBox.addItem(_("Centerline direction"), "CENTERLINE_DIRECTION")
+    self.ui.extensionDirectionComboBox.addItem(_("Boundary normal"), "BOUNDARY_NORMAL")
+    self.ui.extensionDirectionComboBox.connect('currentIndexChanged(int)', self.updateParameterNodeFromGUI)
+    self.ui.transitionMethodComboBox.addItem(_("Linear"), "LINEAR")
+    self.ui.transitionMethodComboBox.addItem(_("Thin plate spline"), "THIN_PLATE_SPLINE")
+    self.ui.transitionMethodComboBox.addItem(_("Ramp"), "RAMP")
+    self.ui.transitionMethodComboBox.connect('currentIndexChanged(int)', self.updateParameterNodeFromGUI)
+    self.ui.transitionToCircularCrossSectionCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
     self.ui.clipPointInsetFactorWidget.connect('valueChanged(double)', self.updateParameterNodeFromGUI)
     self.ui.clippingMethodComboBox.addItem(_("Plane"), "PLANE")
     self.ui.clippingMethodComboBox.addItem(_("Plane + sphere"), "PLANE_SPHERE")
@@ -165,21 +221,28 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.extensionScaleWidget.connect('valueChanged(double)', self.onExtensionScaleChanged)
     self.ui.enableManualPlaneOrigin.setIcon(qt.QIcon(self.resourcePath('Icons/ManualPlaneOrigin.svg')))
     self.ui.enableManualPlaneNormal.setIcon(qt.QIcon(self.resourcePath('Icons/ManualPlaneNormal.svg')))
-    self.ui.toggleOutputVisibilityButton.connect("toggled(bool)", self.onToggleOutputVisibilityButton)
-    self.ui.toggleOutputEdgesButton.connect("toggled(bool)", self.onToggleOutputEdgesButton)
+    # None of these carries a checked state. A checked button would be saying what the display
+    # node holds, and nothing tells it when that changes somewhere else - the Data module, another
+    # module's own show/hide - so the mark would sooner or later contradict the scene. They read
+    # the state at the moment they are pressed and turn it around instead.
+    self.ui.toggleOutputVisibilityButton.connect("clicked()", self.onToggleOutputVisibilityButton)
+    self.ui.toggleOutputEdgesButton.connect("clicked()", self.onToggleOutputEdgesButton)
     self.ui.finishPlaneEditingButton.connect("clicked(bool)", self.finishPlaneEditing)
     self.ui.toggleOutputVisibilityButton.setIcon(qt.QIcon(':/Icons/Medium/SlicerVisibleInvisible.png'))
     self.ui.toggleOutputVisibilityButton.setAutoRaise(True)
+    self.ui.toggleOutputEdgesButton.setIcon(qt.QIcon(self.resourcePath('Icons/ToggleEdges.svg')))
     self.ui.toggleOutputEdgesButton.setAutoRaise(True)
     for button, roleName, objectName in self.inputVisibilityButtons:
         button.setIcon(qt.QIcon(':/Icons/Medium/SlicerVisibleInvisible.png'))
         button.setAutoRaise(True)
-        button.connect("toggled(bool)",
-                       lambda checked, roleName=roleName, button=button, objectName=objectName:
-                       self.onToggleNodeVisibility(roleName, checked, button, objectName))
+        button.connect("clicked()",
+                       lambda roleName=roleName: self.onToggleNodeVisibility(roleName))
 
     for nodeSelector, roleName in self.nodeSelectors:
       nodeSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
+    # A plane is adjusted against the surface it was opened on, so it goes when that surface does.
+    self.ui.inputSurfaceSelector.connect("currentNodeChanged(vtkMRMLNode*)",
+                                         self.onInputSurfaceChanged)
       
     self.addObserver(slicer.mrmlScene, slicer.vtkMRMLScene.EndBatchProcessEvent,
                      self.onSceneBatchProcessEnded)
@@ -190,6 +253,9 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     """
     Called when the application closes and the module widget is destroyed.
     """
+    # Before the observers go: the plane is this widget's, and there will be no widget left to
+    # take it down or to answer for it once the module has been reloaded.
+    self.hideInteractivePlane()
     self.removeObservers()
     # removeObservers() dropped every observation already; clear the trackers so that any
     # signal still arriving during teardown does not attempt a second removal (which would
@@ -248,7 +314,6 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     if not slicer.mrmlScene.IsNodePresent(parameterNode):
         parameterNode = None
     self.ui.inputsCollapsibleButton.enabled = parameterNode is not None
-    self.ui.outputsCollapsibleButton.enabled = parameterNode is not None
     self.ui.advancedCollapsibleButton.enabled = parameterNode is not None
     if parameterNode is None:
         return
@@ -291,7 +356,30 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.preprocessInputSurfaceModelCheckBox.checked = (self._parameterNode.GetParameter("PreprocessInputSurface") == "true")
 
     self.ui.subdivideInputSurfaceModelCheckBox.checked = (self._parameterNode.GetParameter("SubdivideInputSurface") == "true")
-    self.ui.capOutputSurfaceModelCheckBox.checked = (self._parameterNode.GetParameter("CapOutputSurface") == "true")    
+    cap = (self._parameterNode.GetParameter("CapOutputSurface") == "true")
+    self.ui.capOutputSurfaceModelCheckBox.checked = cap
+    capMethod = self._parameterNode.GetParameter("CapMethod") or _DEFAULT_CAP_METHOD
+    capMethodIndex = self.ui.capMethodComboBox.findData(capMethod)
+    if capMethodIndex < 0:
+        # Unknown value (e.g. from a scene saved by a different version): fall back to the
+        # method the module has always used.
+        capMethodIndex = self.ui.capMethodComboBox.findData(_DEFAULT_CAP_METHOD)
+        capMethod = _DEFAULT_CAP_METHOD
+    self.ui.capMethodComboBox.currentIndex = capMethodIndex
+    self.ui.capConstraintFactorWidget.value = float(self._parameterNode.GetParameter("CapConstraintFactor"))
+    self.ui.capNumberOfRingsWidget.value = float(self._parameterNode.GetParameter("CapNumberOfRings"))
+    remeshCaps = (self._parameterNode.GetParameter("RemeshCaps") == "true")
+    self.ui.remeshCapsCheckBox.checked = remeshCaps
+    self.ui.capTargetEdgeLengthWidget.value = float(self._parameterNode.GetParameter("CapTargetEdgeLength"))
+    self.updateCapMethodUI(cap, capMethod, remeshCaps)
+    labelModelFaces = (self._parameterNode.GetParameter("LabelModelFaces") == "true")
+    self.ui.labelModelFacesCheckBox.checked = labelModelFaces
+    # Only write the line edit when it differs, so a GUI refresh does not move the text cursor.
+    modelFaceIdArrayName = self._parameterNode.GetParameter("ModelFaceIdArrayName")
+    if self.ui.modelFaceIdArrayNameLineEdit.text != modelFaceIdArrayName:
+        self.ui.modelFaceIdArrayNameLineEdit.text = modelFaceIdArrayName
+    self.ui.modelFaceIdArrayNameLabel.enabled = labelModelFaces
+    self.ui.modelFaceIdArrayNameLineEdit.enabled = labelModelFaces
     addFlowExtensions = (self._parameterNode.GetParameter("ExtendOutputSurface") == "true")
     self.ui.addFlowExtensionsCheckBox.checked = addFlowExtensions
     # The per-endpoint extension length scale only has an effect when flow extensions are added.
@@ -299,13 +387,13 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.extensionScaleWidget.setVisible(addFlowExtensions)
     self.ui.extensionRatioWidget.value = float(self._parameterNode.GetParameter("ExtensionRatio"))
     self.ui.transitionRatioWidget.value = float(self._parameterNode.GetParameter("ExtensionTransitionRatio"))
-    extensionModeIndex = self.ui.extensionModeComboBox.findData(_normalizedModeId(self._parameterNode.GetParameter("ExtensionMode")))
-    if extensionModeIndex >= 0:
-        self.ui.extensionModeComboBox.currentIndex = extensionModeIndex
-    interpolationModeIndex = self.ui.interpolationModeComboBox.findData(_normalizedModeId(self._parameterNode.GetParameter("InterpolationMode")))
-    if interpolationModeIndex >= 0:
-        self.ui.interpolationModeComboBox.currentIndex = interpolationModeIndex
-    self.ui.preserveCrossSectionShapeCheckBox.checked = (self._parameterNode.GetParameter("PreserveCrossSectionShape") == "true")
+    extensionDirectionIndex = self.ui.extensionDirectionComboBox.findData(_normalizedOptionId(self._parameterNode.GetParameter("ExtensionDirection")))
+    if extensionDirectionIndex >= 0:
+        self.ui.extensionDirectionComboBox.currentIndex = extensionDirectionIndex
+    transitionMethodIndex = self.ui.transitionMethodComboBox.findData(_normalizedOptionId(self._parameterNode.GetParameter("TransitionMethod")))
+    if transitionMethodIndex >= 0:
+        self.ui.transitionMethodComboBox.currentIndex = transitionMethodIndex
+    self.ui.transitionToCircularCrossSectionCheckBox.checked = (self._parameterNode.GetParameter("TransitionToCircularCrossSection") == "true")
     autoApply = self._parameterNode.GetParameter("AutoApplyPlane") == "true"
     self.ui.applyButton.checkable = autoApply
     self.ui.applyButton.checked = autoApply
@@ -402,18 +490,26 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     parameterNode.SetParameter("PreprocessInputSurface", "true" if self.ui.preprocessInputSurfaceModelCheckBox.checked else "false")
     parameterNode.SetParameter("SubdivideInputSurface", "true" if self.ui.subdivideInputSurfaceModelCheckBox.checked else "false")
     parameterNode.SetParameter("CapOutputSurface", "true" if self.ui.capOutputSurfaceModelCheckBox.checked else "false")
+    capMethod = self.ui.capMethodComboBox.currentData
+    if capMethod:
+        parameterNode.SetParameter("CapMethod", capMethod)
+    parameterNode.SetParameter("CapConstraintFactor", str(self.ui.capConstraintFactorWidget.value))
+    parameterNode.SetParameter("CapNumberOfRings", str(int(round(self.ui.capNumberOfRingsWidget.value))))
+    parameterNode.SetParameter("RemeshCaps", "true" if self.ui.remeshCapsCheckBox.checked else "false")
+    parameterNode.SetParameter("CapTargetEdgeLength", str(self.ui.capTargetEdgeLengthWidget.value))
+    parameterNode.SetParameter("LabelModelFaces", "true" if self.ui.labelModelFacesCheckBox.checked else "false")
     parameterNode.SetParameter("ExtendOutputSurface", "true" if self.ui.addFlowExtensionsCheckBox.checked else "false")
     parameterNode.SetParameter("ExtensionRatio", str(self.ui.extensionRatioWidget.value))
     parameterNode.SetParameter("ExtensionTransitionRatio", str(self.ui.transitionRatioWidget.value))
     # currentData is None while the combobox is still empty (during widget setup); skip the
     # write instead of passing None to SetParameter.
-    extensionMode = self.ui.extensionModeComboBox.currentData
-    if extensionMode:
-        parameterNode.SetParameter("ExtensionMode", extensionMode)
-    interpolationMode = self.ui.interpolationModeComboBox.currentData
-    if interpolationMode:
-        parameterNode.SetParameter("InterpolationMode", interpolationMode)
-    parameterNode.SetParameter("PreserveCrossSectionShape", "true" if self.ui.preserveCrossSectionShapeCheckBox.checked else "false")
+    extensionDirection = self.ui.extensionDirectionComboBox.currentData
+    if extensionDirection:
+        parameterNode.SetParameter("ExtensionDirection", extensionDirection)
+    transitionMethod = self.ui.transitionMethodComboBox.currentData
+    if transitionMethod:
+        parameterNode.SetParameter("TransitionMethod", transitionMethod)
+    parameterNode.SetParameter("TransitionToCircularCrossSection", "true" if self.ui.transitionToCircularCrossSectionCheckBox.checked else "false")
     parameterNode.SetParameter("AutoApplyPlane", "true" if self.ui.applyButton.checked else "false")
     parameterNode.SetParameter("ClipPointInsetFactor", str(self.ui.clipPointInsetFactorWidget.value))
     parameterNode.SetParameter("SnapClipPointsToCenterline", "true" if self.ui.snapClipPointsToCenterlineCheckBox.checked else "false")
@@ -439,6 +535,8 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.removeObserver(self._observedClipPointsNode, slicer.vtkMRMLMarkupsNode.PointStartInteractionEvent, self.onClipPointInteractionStarted)
         self.removeObserver(self._observedClipPointsNode, slicer.vtkMRMLMarkupsNode.PointModifiedEvent, self.onClipPointModified)
         self.removeObserver(self._observedClipPointsNode, slicer.vtkMRMLMarkupsNode.PointEndInteractionEvent, self.onClipPointInteractionEnded)
+        self.removeObserver(self._observedClipPointsNode, slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent, self.onClipPointAdded)
+        self.removeObserver(self._observedClipPointsNode, slicer.vtkMRMLMarkupsNode.PointRemovedEvent, self.onClipPointRemoved)
     self._observedClipPointsNode = clipPointsNode
     if clipPointsNode:
         clipPointsNode.CreateDefaultDisplayNodes()
@@ -450,6 +548,12 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.addObserver(clipPointsNode, slicer.vtkMRMLMarkupsNode.PointStartInteractionEvent, self.onClipPointInteractionStarted)
         self.addObserver(clipPointsNode, slicer.vtkMRMLMarkupsNode.PointModifiedEvent, self.onClipPointModified)
         self.addObserver(clipPointsNode, slicer.vtkMRMLMarkupsNode.PointEndInteractionEvent, self.onClipPointInteractionEnded)
+        # Placing or deleting a point changes the clip just as much as dragging one does, but
+        # neither goes through the interaction events above (placement ends with a defined
+        # position, deletion happens from the markups list or the Delete key), so the output
+        # would have stayed stale until the next unrelated edit.
+        self.addObserver(clipPointsNode, slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent, self.onClipPointAdded)
+        self.addObserver(clipPointsNode, slicer.vtkMRMLMarkupsNode.PointRemovedEvent, self.onClipPointRemoved)
         self.updateClipPointsSnapMode()
 
   def activeClipPointId(self):
@@ -458,6 +562,104 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     if not clipPointsNode or not (0 <= self._activeClipPointIndex < clipPointsNode.GetNumberOfControlPoints()):
         return None
     return clipPointsNode.GetNthControlPointID(self._activeClipPointIndex)
+
+  def onLabelModelFacesToggled(self, checked=None):
+    self.updateParameterNodeFromGUI()
+    # An output already in the scene follows the checkbox straight away, not at the next Apply.
+    self.updateOutputFaceColoring()
+
+  def faceColorTable(self, create=True):
+    """The color table naming and coloring each face, referenced from the parameter node so that
+    it is saved with the scene."""
+    node = self._parameterNode.GetNodeReference("FaceColorTable") if self._parameterNode else None
+    if node is None and create and self._parameterNode is not None:
+        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLColorTableNode", _("Clip Vessel face colors"))
+        node.SetTypeToUser()
+        self._parameterNode.SetNodeReferenceID("FaceColorTable", node.GetID())
+    return node
+
+  def updateFaceColorTable(self):
+    """Rebuild the color table naming each face from what the last run recorded, or return None
+    before the first labeling run, when there are no names to show."""
+    outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel") if self._parameterNode else None
+    outputPolyData = outputModelNode.GetPolyData() if outputModelNode else None
+    nameByFaceId = dict(self.logic.lastFaceIdLayout(outputPolyData))
+    colorTableNode = self.faceColorTable() if nameByFaceId else None
+    if colorTableNode is None:
+        return None
+    numberOfColors = max(nameByFaceId) + 1
+    wasModifying = colorTableNode.StartModify()
+    colorTableNode.SetNumberOfColors(numberOfColors)
+    for faceId in range(numberOfColors):
+        name = nameByFaceId.get(faceId)
+        if name is None:
+            # Entry 0, and any gap left by a clip point that made no cut. Opaque, because one
+            # transparent entry makes VTK treat the whole model as translucent, but undefined so
+            # that the legend leaves it out - it lists exactly the entries with GetColorDefined.
+            colorTableNode.SetColor(faceId, "", 0.35, 0.35, 0.35, 1.0)
+            colorTableNode.SetColorDefined(faceId, False)
+        else:
+            colorTableNode.SetColor(faceId, name, *_faceColor(faceId, faceId == self.logic.lastWallFaceId), 1.0)
+    # A color table's lookup table spans 0-255 whatever its size, which would land every face id
+    # on entry 0. Make the range describe the table so that face id N resolves to entry N.
+    colorTableNode.GetLookupTable().SetTableRange(0, numberOfColors)
+    colorTableNode.EndModify(wasModifying)
+    return colorTableNode
+
+  def updateOutputFaceColoring(self):
+    """Color the output model by its face id array, with a legend naming each face, while
+    labeling is on; plain surface color and no legend when it is off."""
+    if self._parameterNode is None:
+        return
+    outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel")
+    displayNode = outputModelNode.GetDisplayNode() if outputModelNode else None
+    if displayNode is None:
+        return
+    arrayName = (self._parameterNode.GetParameter("ModelFaceIdArrayName")
+                 or _DEFAULT_MODEL_FACE_ID_ARRAY_NAME)
+    # Only color by the array if it is there: the checkbox can be ticked before the output has
+    # ever been computed with labeling enabled.
+    outputPolyData = outputModelNode.GetPolyData()
+    colorTableNode = None
+    if (self._parameterNode.GetParameter("LabelModelFaces") == "true" and outputPolyData is not None
+            and outputPolyData.GetCellData().GetArray(arrayName) is not None):
+        colorTableNode = self.faceColorTable(create=False) or self.updateFaceColorTable()
+    displayNode.SetScalarVisibility(colorTableNode is not None)
+
+    legendDisplayNode = slicer.modules.colors.logic().GetColorLegendDisplayNode(outputModelNode)
+    if colorTableNode is None:
+        if legendDisplayNode:
+            legendDisplayNode.SetVisibility(False)
+        return
+    displayNode.SetActiveScalarName(arrayName)
+    displayNode.SetActiveAttributeLocation(vtk.vtkAssignAttribute.CELL_DATA)
+    displayNode.SetAndObserveColorNodeID(colorTableNode.GetID())
+    displayNode.SetScalarRangeFlag(slicer.vtkMRMLDisplayNode.UseColorNodeScalarRange)
+
+    if legendDisplayNode is None:
+        legendDisplayNode = slicer.modules.colors.logic().AddDefaultColorLegendDisplayNode(outputModelNode)
+        if legendDisplayNode is None:
+            return
+    legendDisplayNode.SetTitleText(arrayName)
+    # The label format has to be set alongside UseColorNamesForLabels: turned on from code rather
+    # than from the Colors module GUI it stays at the numeric default, and the scalar bar then
+    # renders "(none)" for every row. Everything else the legend needs it takes from the model's
+    # own display node, or decides for itself in this mode.
+    legendDisplayNode.SetUseColorNamesForLabels(True)
+    legendDisplayNode.SetLabelFormat(legendDisplayNode.GetDefaultTextLabelFormat())
+    legendDisplayNode.SetVisibility(True)
+
+  def onModelFaceIdArrayNameEditingFinished(self):
+    """Write the face id array name back to the parameter node once the user is done editing
+    it. An empty name cannot address a cell array, so it falls back to the default."""
+    if self._parameterNode is None:
+        return
+    modelFaceIdArrayName = self.ui.modelFaceIdArrayNameLineEdit.text.strip()
+    if not modelFaceIdArrayName:
+        modelFaceIdArrayName = _DEFAULT_MODEL_FACE_ID_ARRAY_NAME
+        self.ui.modelFaceIdArrayNameLineEdit.text = modelFaceIdArrayName
+    self._parameterNode.SetParameter("ModelFaceIdArrayName", modelFaceIdArrayName)
+    self.updateOutputFaceColoring()
 
   def onSnapClipPointsToCenterlineToggled(self, checked=None):
     self.updateParameterNodeFromGUI()
@@ -563,6 +765,22 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.updateParameterNodeFromGUI()
     self.updatePlaneHandleMode()
 
+  def updateCapMethodUI(self, cap, capMethod, remeshCaps=False):
+    """Show the cap method next to the cap checkbox, the shape controls of the smooth capper only
+    when that method is the one selected, and the cap element size only when the caps are being
+    remeshed to a uniform mesh."""
+    self.ui.capMethodLabel.setVisible(cap)
+    self.ui.capMethodComboBox.setVisible(cap)
+    smooth = cap and capMethod == "SMOOTH"
+    self.ui.capConstraintFactorLabel.setVisible(smooth)
+    self.ui.capConstraintFactorWidget.setVisible(smooth)
+    self.ui.capNumberOfRingsLabel.setVisible(smooth)
+    self.ui.capNumberOfRingsWidget.setVisible(smooth)
+    self.ui.remeshCapsLabel.setVisible(cap)
+    self.ui.remeshCapsCheckBox.setVisible(cap)
+    self.ui.capTargetEdgeLengthLabel.setVisible(cap and remeshCaps)
+    self.ui.capTargetEdgeLengthWidget.setVisible(cap and remeshCaps)
+
   def onClippingMethodChanged(self, index=None):
     self.updateParameterNodeFromGUI()
     self.updateClippingMethodUI(self.ui.clippingMethodComboBox.currentData)
@@ -660,72 +878,65 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     else:
         displayNode.SetOpacity(opacity)
 
-  def updateOutputVisibilityButton(self):
-    """Sync the Outputs show/hide button with the output model's actual display visibility,
-    without triggering onToggleOutputVisibilityButton (which would otherwise flip visibility
-    right back)."""
+  def outputSurfaceDisplayNode(self):
     outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel") if self._parameterNode else None
-    displayNode = outputModelNode.GetDisplayNode() if outputModelNode else None
-    self.ui.toggleOutputVisibilityButton.enabled = displayNode is not None
-    visible = displayNode.GetVisibility() if displayNode else True
-    wasBlocked = self.ui.toggleOutputVisibilityButton.blockSignals(True)
-    self.ui.toggleOutputVisibilityButton.checked = visible
-    self.ui.toggleOutputVisibilityButton.toolTip = _("Hide output surface") if visible else _("Show output surface")
-    self.ui.toggleOutputVisibilityButton.blockSignals(wasBlocked)
+    return outputModelNode.GetDisplayNode() if outputModelNode else None
 
-  def onToggleOutputVisibilityButton(self, checked=None):
-    outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel") if self._parameterNode else None
-    displayNode = outputModelNode.GetDisplayNode() if outputModelNode else None
+  def updateOutputVisibilityButton(self):
+    """Offer the Outputs show/hide button only while there is something to show or hide. What it
+    would show or hide is not asked here: the button says nothing about the state of the surface,
+    so there is nothing about it to keep in step (see setup)."""
+    self.ui.toggleOutputVisibilityButton.enabled = self.outputSurfaceDisplayNode() is not None
+
+  def onToggleOutputVisibilityButton(self):
+    displayNode = self.outputSurfaceDisplayNode()
     if displayNode:
-        displayNode.SetVisibility(checked)
-    self.ui.toggleOutputVisibilityButton.toolTip = _("Hide output surface") if checked else _("Show output surface")
+        displayNode.SetVisibility(not displayNode.GetVisibility())
 
   def updateOutputEdgesButton(self):
-    """Sync the Outputs edge toggle with the output model display node."""
-    outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel") if self._parameterNode else None
-    displayNode = outputModelNode.GetDisplayNode() if outputModelNode else None
-    self.ui.toggleOutputEdgesButton.enabled = displayNode is not None
-    edgeVisible = displayNode.GetEdgeVisibility() if displayNode else False
-    wasBlocked = self.ui.toggleOutputEdgesButton.blockSignals(True)
-    self.ui.toggleOutputEdgesButton.checked = edgeVisible
-    self.ui.toggleOutputEdgesButton.blockSignals(wasBlocked)
+    """Offer the Outputs edge toggle only while there is a surface whose edges could be drawn."""
+    self.ui.toggleOutputEdgesButton.enabled = self.outputSurfaceDisplayNode() is not None
 
-  def onToggleOutputEdgesButton(self, checked=None):
-    outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel") if self._parameterNode else None
-    displayNode = outputModelNode.GetDisplayNode() if outputModelNode else None
+  def onToggleOutputEdgesButton(self):
+    displayNode = self.outputSurfaceDisplayNode()
     if displayNode:
-        displayNode.SetEdgeVisibility(checked)
+        displayNode.SetEdgeVisibility(not displayNode.GetEdgeVisibility())
 
   def updateInputVisibilityButtons(self):
-    for button, roleName, objectName in self.inputVisibilityButtons:
+    for button, roleName, _objectName in self.inputVisibilityButtons:
         node = self._parameterNode.GetNodeReference(roleName) if self._parameterNode else None
-        displayNode = node.GetDisplayNode() if node else None
-        button.enabled = displayNode is not None
-        visible = displayNode.GetVisibility() if displayNode else True
-        wasBlocked = button.blockSignals(True)
-        button.checked = visible
-        button.toolTip = (_("Hide {object_name}") if visible else _("Show {object_name}")).format(object_name=objectName)
-        button.blockSignals(wasBlocked)
+        button.enabled = (node.GetDisplayNode() if node else None) is not None
 
-  def onToggleNodeVisibility(self, roleName, checked, button, objectName):
+  def onToggleNodeVisibility(self, roleName):
     node = self._parameterNode.GetNodeReference(roleName) if self._parameterNode else None
     displayNode = node.GetDisplayNode() if node else None
     if displayNode:
-        displayNode.SetVisibility(checked)
-    button.toolTip = (_("Hide {object_name}") if checked else _("Show {object_name}")).format(object_name=objectName)
+        displayNode.SetVisibility(not displayNode.GetVisibility())
+
+  def onInputSurfaceChanged(self, node=None):
+    self.hideInteractivePlane()
+    self.updateManualPlaneButtonStates()
+
+  def hideInteractivePlane(self):
+    """Take the plane being adjusted out of the views, and stop adjusting it.
+
+    A plane stands for one clip point of one surface. Whatever leaves that behind - the module
+    being reloaded, another surface being chosen, the points being replaced - has to take the
+    plane with it, or it is left lying in the views over something it has nothing to do with.
+    """
+    for roleName in ("ManualClipPlane", "ManualClipPlaneNormalHandle"):
+        node = self._parameterNode.GetNodeReference(roleName) if self._parameterNode else None
+        if node:
+            node.SetDisplayVisibility(False)
+    self._activeClipPointIndex = -1
+    self._activeClipPointId = None
+    self._planeEditing = False
+    self.ui.finishPlaneEditingButton.enabled = False
 
   def finishPlaneEditing(self):
     """Hide temporary plane markups and leave interactive plane editing mode."""
-    planeNode = self._parameterNode.GetNodeReference("ManualClipPlane") if self._parameterNode else None
-    normalHandleNode = self._parameterNode.GetNodeReference("ManualClipPlaneNormalHandle") if self._parameterNode else None
-    if planeNode:
-        planeNode.SetDisplayVisibility(False)
-    if normalHandleNode:
-        normalHandleNode.SetDisplayVisibility(False)
-    self._activeClipPointIndex = -1
-    self._planeEditing = False
+    self.hideInteractivePlane()
     self.updateManualPlaneButtonStates()
-    self.ui.finishPlaneEditingButton.enabled = False
     self.ui.clipStatusLabel.text = _("Plane editing finished. Click a clip point to edit another plane.")
     self.ui.clipStatusLabel.styleSheet = ""
 
@@ -848,6 +1059,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self._normalHandleDistance = max(radius * 2.0, 1.0)
 
     self._activeClipPointIndex = pointIndex
+    self._activeClipPointId = pointId
     self._planeEditing = True
     # Reflect this point's stored manual-override state in the snap buttons before the
     # handle visibility (which depends on the button states) is updated below.
@@ -997,6 +1209,54 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     if moved:
         self.scheduleAutoApply()
 
+  def onClipPointAdded(self, caller=None, event=None):
+    """A newly placed clip point adds a cut, so refresh the output. Observing the
+    position-defined event rather than the point-added event skips the preview point that
+    follows the mouse while placement is still in progress."""
+    if self._updatingInteractivePlane:
+        return
+    self.scheduleAutoApply()
+
+  def onClipPointRemoved(self, caller=None, event=None):
+    """A deleted clip point removes a cut, so refresh the output."""
+    if self._updatingInteractivePlane:
+        return
+    self.forgetRemovedClipPointOverrides(caller)
+    self.resyncActiveClipPointIndex(caller)
+    self.scheduleAutoApply()
+
+  def forgetRemovedClipPointOverrides(self, clipPointsNode):
+    """Drop the manual plane and extension length overrides of points that no longer exist,
+    so they neither accumulate in the saved scene nor come back to life if a control point ID
+    is ever reused."""
+    remainingIds = set()
+    if clipPointsNode:
+        remainingIds = {clipPointsNode.GetNthControlPointID(index)
+                        for index in range(clipPointsNode.GetNumberOfControlPoints())}
+    removedAny = False
+    for overrides in (self._manualPlaneNormals, self._manualPlaneOrigins, self._extensionLengthScaleFactors):
+        for pointId in [pointId for pointId in overrides if pointId not in remainingIds]:
+            del overrides[pointId]
+            removedAny = True
+    if removedAny:
+        self.saveManualPlaneNormals()
+
+  def resyncActiveClipPointIndex(self, clipPointsNode):
+    """Deleting a point shifts the indices of every point after it, so re-find the point
+    whose plane is being edited by its ID; if that point is the deleted one, stop editing."""
+    if self._activeClipPointIndex < 0:
+        return
+    newIndex = -1
+    if clipPointsNode and self._activeClipPointId is not None:
+        for index in range(clipPointsNode.GetNumberOfControlPoints()):
+            if clipPointsNode.GetNthControlPointID(index) == self._activeClipPointId:
+                newIndex = index
+                break
+    if newIndex < 0:
+        self.finishPlaneEditing()
+    else:
+        self._activeClipPointIndex = newIndex
+
   def onDetectClipPointsButton(self):
     """Populate ClipPoints with one point per centerline terminus (the inlet plus every
     branch outlet), each pulled inward from the vessel surface by the configured inset.
@@ -1011,11 +1271,10 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         return
 
     insetFactor = self.ui.clipPointInsetFactorWidget.value
-    try:
+    # As in onApplyButton: the details section carries the traceback, nothing is shown while
+    # testing, and the failure is re-raised rather than reported and stepped over.
+    with slicer.util.tryWithErrorDisplay(_("Failed to detect clip points."), waitCursor=True):
         terminuses = self.logic.detectCenterlineTerminusClipPoints(centerlinesNode, insetFactor)
-    except Exception as e:
-        slicer.util.errorDisplay(_("Failed to detect clip points: {message}").format(message=str(e)))
-        return
     if not terminuses:
         slicer.util.errorDisplay(_("Could not detect any centerline terminuses. Check the input centerlines."))
         return
@@ -1031,15 +1290,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return
 
     # Stop showing/adjusting whatever plane was up before the points underneath it are replaced.
-    self._activeClipPointIndex = -1
-    self._planeEditing = False
-    self.ui.finishPlaneEditingButton.enabled = False
-    planeNode = self._parameterNode.GetNodeReference("ManualClipPlane")
-    if planeNode:
-        planeNode.SetDisplayVisibility(False)
-    normalHandleNode = self._parameterNode.GetNodeReference("ManualClipPlaneNormalHandle")
-    if normalHandleNode:
-        normalHandleNode.SetDisplayVisibility(False)
+    self.hideInteractivePlane()
 
     wasModify = clipPointsNode.StartModify()
     clipPointsNode.RemoveAllControlPoints()
@@ -1064,8 +1315,16 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
   def scheduleAutoApply(self):
     if (not self._applying and not self.updatingGUIFromParameterNode
         and self.ui.applyButton.checked
-        and self.ui.applyButton.enabled):
+        and self.ui.applyButton.enabled
+        and self.hasClipPoints()):
         self.autoApplyTimer.start()
+
+  def hasClipPoints(self):
+    """There is nothing to clip without clip points, and clipping raises rather than
+    producing an uncut surface. Deleting the last point should leave the previous output
+    alone, not pop an error dialog; an explicit Apply click still reports the problem."""
+    clipPointsNode = self._parameterNode.GetNodeReference("ClipPoints") if self._parameterNode else None
+    return bool(clipPointsNode) and clipPointsNode.GetNumberOfControlPoints() > 0
 
   def onAutoApplyTimeout(self):
     if not self._applying and not self.updatingGUIFromParameterNode:
@@ -1093,8 +1352,12 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     targetNumberOfPoints = float(self._parameterNode.GetParameter("TargetNumberOfPoints"))
     decimationAggressiveness = float(self._parameterNode.GetParameter("DecimationAggressiveness"))
     subdivideInputSurface = (self._parameterNode.GetParameter("SubdivideInputSurface") == "true")
+    labelModelFaces = (self._parameterNode.GetParameter("LabelModelFaces") == "true")
+    modelFaceIdArrayName = (self._parameterNode.GetParameter("ModelFaceIdArrayName")
+                            or _DEFAULT_MODEL_FACE_ID_ARRAY_NAME)
     cacheKey = (self._parameterNode.GetNodeReferenceID("InputSurface"), sourceMTime, segmentId,
-                preprocessEnabled, targetNumberOfPoints, decimationAggressiveness, subdivideInputSurface)
+                preprocessEnabled, targetNumberOfPoints, decimationAggressiveness, subdivideInputSurface,
+                labelModelFaces, modelFaceIdArrayName)
     if cacheKey == self._preprocessedCacheKey and self._preprocessedPolyData is not None:
         return self._preprocessedPolyData
 
@@ -1107,11 +1370,52 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     else:
         resultPolyData = self.logic.preprocess(inputSurfacePolyData, targetNumberOfPoints, decimationAggressiveness, subdivideInputSurface)
         print(f"Target points: {targetNumberOfPoints}... Number of points in preprocessed surface:  {resultPolyData.GetNumberOfPoints()}")
+        if labelModelFaces:
+            # Re-derive the labels by position rather than trusting what preprocessing left of
+            # the cell array (see transferFaceLabels).
+            self.logic.transferFaceLabels(inputSurfacePolyData, resultPolyData, modelFaceIdArrayName)
 
     self._preprocessedCacheKey = cacheKey
     self._preprocessedPolyData = vtk.vtkPolyData()
     self._preprocessedPolyData.DeepCopy(resultPolyData)
     return self._preprocessedPolyData
+
+  def onApplyButtonClicked(self, clicked=False):
+    """Apply, warning first if preprocessing will rebuild a labeled input. Only the explicit
+    click comes through here, so a modal dialog cannot interrupt an interactive plane drag."""
+    if self.confirmPreprocessingDiscardsFaceLabels():
+        self.onApplyButton()
+
+  def confirmPreprocessingDiscardsFaceLabels(self):
+    """True if the run should go ahead. Only decimation - which happens when the target point
+    count is below the input's own - moves the face boundaries, so only that is worth asking
+    about."""
+    parameterNode = self._parameterNode
+    if (parameterNode is None
+            or parameterNode.GetParameter("LabelModelFaces") != "true"
+            or parameterNode.GetParameter("PreprocessInputSurface") != "true"):
+        return True
+    inputSurfaceNode = parameterNode.GetNodeReference("InputSurface")
+    inputPolyData = (inputSurfaceNode.GetPolyData()
+                     if inputSurfaceNode and inputSurfaceNode.IsA("vtkMRMLModelNode") else None)
+    faceIdArrayName = (parameterNode.GetParameter("ModelFaceIdArrayName")
+                       or _DEFAULT_MODEL_FACE_ID_ARRAY_NAME)
+    if inputPolyData is None or inputPolyData.GetCellData().GetArray(faceIdArrayName) is None:
+        return True
+    targetNumberOfPoints = float(parameterNode.GetParameter("TargetNumberOfPoints"))
+    if targetNumberOfPoints >= inputPolyData.GetNumberOfPoints():
+        # No decimation, so preprocessing carries the labels through intact.
+        return True
+    return slicer.util.confirmOkCancelDisplay(
+        _("Preprocessing will decimate this surface to {target_point_count} points. Its "
+          "'{array_name}' face labels are carried onto the new cells by position, so no face is lost, "
+          "but face boundaries can shift by about one cell.\n\n"
+          "Cancel to turn off 'Preprocess input surface', or to raise the target above "
+          "{input_point_count} points.").format(
+              array_name=faceIdArrayName,
+              target_point_count=int(targetNumberOfPoints),
+              input_point_count=inputPolyData.GetNumberOfPoints()),
+        windowTitle=_("Clip Vessel"))
 
   def onApplyButton(self):
     """
@@ -1124,77 +1428,101 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     if self.autoApplyTimer.isActive():
         self.autoApplyTimer.stop()
     self._applying = True
-    qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
     try:
-        # Preprocessing
-        slicer.util.showStatusMessage(_("Preprocessing..."))
-        slicer.app.processEvents()  # force update
-        preprocessedPolyData = self.getPreprocessedPolyData()
-        # Save preprocessing result to model node. Skip the (surprisingly non-trivial)
-        # SetAndObserveMesh + render update when it's the exact same cached polydata as
-        # last time, which is the common case while only a clip plane is being edited.
-        preprocessedSurfaceModelNode = self._parameterNode.GetNodeReference("PreprocessedSurface")
-        if preprocessedSurfaceModelNode and preprocessedSurfaceModelNode.GetPolyData() is not preprocessedPolyData:
-            preprocessedSurfaceModelNode.SetAndObserveMesh(preprocessedPolyData)
-            if not preprocessedSurfaceModelNode.GetDisplayNode():
-                preprocessedSurfaceModelNode.CreateDefaultDisplayNodes()
-                preprocessedSurfaceModelNode.GetDisplayNode().SetColor(1.0, 1.0, 0.0)
-                preprocessedSurfaceModelNode.GetDisplayNode().SetOpacity(0.4)
-                preprocessedSurfaceModelNode.GetDisplayNode().SetLineWidth(2)
+        # tryWithErrorDisplay puts the whole traceback in the dialog's details section,
+        # which is the only way to tell from a report where a failure actually came from.
+        # It stays silent when Slicer is in testing mode, so an automated run is not left
+        # waiting on a dialog nobody will dismiss, and it re-raises, so a run that failed
+        # is reported as failed rather than passing quietly.
+        with slicer.util.tryWithErrorDisplay(_("Failed to compute results."), waitCursor=True):
+            # Preprocessing
+            slicer.util.showStatusMessage(_("Preprocessing..."))
+            slicer.app.processEvents()  # force update
+            preprocessedPolyData = self.getPreprocessedPolyData()
+            # Save preprocessing result to model node. Skip the (surprisingly non-trivial)
+            # SetAndObserveMesh + render update when it's the exact same cached polydata as
+            # last time, which is the common case while only a clip plane is being edited.
+            preprocessedSurfaceModelNode = self._parameterNode.GetNodeReference("PreprocessedSurface")
+            if preprocessedSurfaceModelNode and preprocessedSurfaceModelNode.GetPolyData() is not preprocessedPolyData:
+                preprocessedSurfaceModelNode.SetAndObserveMesh(preprocessedPolyData)
+                if not preprocessedSurfaceModelNode.GetDisplayNode():
+                    preprocessedSurfaceModelNode.CreateDefaultDisplayNodes()
+                    preprocessedSurfaceModelNode.GetDisplayNode().SetColor(1.0, 1.0, 0.0)
+                    preprocessedSurfaceModelNode.GetDisplayNode().SetOpacity(0.4)
+                    preprocessedSurfaceModelNode.GetDisplayNode().SetLineWidth(2)
 
-        clipPointsMarkupsNode = self._parameterNode.GetNodeReference("ClipPoints")
-        centerlinesModelNode = self._parameterNode.GetNodeReference("InputCenterlines")
-        outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel")
-        extensionRatio = float(self._parameterNode.GetParameter("ExtensionRatio"))
-        transitionRatio = float(self._parameterNode.GetParameter("ExtensionTransitionRatio"))
-        self.saveManualPlaneNormals()
+            clipPointsMarkupsNode = self._parameterNode.GetNodeReference("ClipPoints")
+            centerlinesModelNode = self._parameterNode.GetNodeReference("InputCenterlines")
+            outputModelNode = self._parameterNode.GetNodeReference("OutputSurfaceModel")
+            extensionRatio = float(self._parameterNode.GetParameter("ExtensionRatio"))
+            transitionRatio = float(self._parameterNode.GetParameter("ExtensionTransitionRatio"))
+            self.saveManualPlaneNormals()
 
-        # Read processing options from the parameter node. The GUI may still be
-        # synchronizing after a saved scene is restored.
-        cap = self._parameterNode.GetParameter("CapOutputSurface") == "true"
-        addFlowExtensions = self._parameterNode.GetParameter("ExtendOutputSurface") == "true"
-        extensionMode = _normalizedModeId(self._parameterNode.GetParameter("ExtensionMode"))
-        interpolationMode = _normalizedModeId(self._parameterNode.GetParameter("InterpolationMode"))
-        preserveCrossSectionShape = self._parameterNode.GetParameter("PreserveCrossSectionShape") == "true"
-        clippingMethod = self._parameterNode.GetParameter("ClippingMethod") or "PLANE_PATCH"
-        sphereRadiusFactor = float(self._parameterNode.GetParameter("LocalSphereRadiusFactor"))
+            # Read processing options from the parameter node. The GUI may still be
+            # synchronizing after a saved scene is restored.
+            cap = self._parameterNode.GetParameter("CapOutputSurface") == "true"
+            capMethod = self._parameterNode.GetParameter("CapMethod") or _DEFAULT_CAP_METHOD
+            capConstraintFactor = float(self._parameterNode.GetParameter("CapConstraintFactor"))
+            capNumberOfRings = int(float(self._parameterNode.GetParameter("CapNumberOfRings")))
+            remeshCaps = self._parameterNode.GetParameter("RemeshCaps") == "true"
+            capTargetEdgeLength = float(self._parameterNode.GetParameter("CapTargetEdgeLength"))
+            labelModelFaces = self._parameterNode.GetParameter("LabelModelFaces") == "true"
+            modelFaceIdArrayName = (self._parameterNode.GetParameter("ModelFaceIdArrayName")
+                                    or _DEFAULT_MODEL_FACE_ID_ARRAY_NAME)
+            addFlowExtensions = self._parameterNode.GetParameter("ExtendOutputSurface") == "true"
+            extensionDirection = _normalizedOptionId(self._parameterNode.GetParameter("ExtensionDirection"))
+            transitionMethod = _normalizedOptionId(self._parameterNode.GetParameter("TransitionMethod"))
+            transitionToCircularCrossSection = self._parameterNode.GetParameter("TransitionToCircularCrossSection") == "true"
+            clippingMethod = self._parameterNode.GetParameter("ClippingMethod") or "PLANE_PATCH"
+            sphereRadiusFactor = float(self._parameterNode.GetParameter("LocalSphereRadiusFactor"))
 
-        slicer.util.showStatusMessage(_("Clipping model..."))
-        slicer.app.processEvents()  # force update
+            slicer.util.showStatusMessage(_("Clipping model..."))
+            slicer.app.processEvents()  # force update
 
-        outputPolyData = self.logic.clipVessel(preprocessedPolyData, centerlinesModelNode, clipPointsMarkupsNode,
-                                               cap, addFlowExtensions, extensionRatio, extensionMode,
-                                               self._manualPlaneNormals, self._manualPlaneOrigins,
-                                               self._activeClipPointIndex, clippingMethod, sphereRadiusFactor,
-                                               transitionRatio, interpolationMode, preserveCrossSectionShape,
-                                               self._extensionLengthScaleFactors)
+            outputPolyData = self.logic.clipVessel(preprocessedPolyData, centerlinesModelNode, clipPointsMarkupsNode,
+                                                   cap, addFlowExtensions, extensionRatio, extensionDirection,
+                                                   self._manualPlaneNormals, self._manualPlaneOrigins,
+                                                   self._activeClipPointIndex, clippingMethod, sphereRadiusFactor,
+                                                   transitionRatio, transitionMethod, transitionToCircularCrossSection,
+                                                   self._extensionLengthScaleFactors,
+                                                   labelModelFaces, modelFaceIdArrayName,
+                                                   capMethod, capConstraintFactor, capNumberOfRings,
+                                                   remeshCaps, capTargetEdgeLength)
 
-        outputModelNode.SetAndObserveMesh(outputPolyData)
-        if not outputModelNode.GetDisplayNode():
-            outputModelNode.CreateDefaultDisplayNodes()
-            outputModelNode.GetDisplayNode().SetColor(0.75, 0.75, 0.75)
-            outputModelNode.GetDisplayNode().SetLineWidth(3)
-        self.updateOutputVisibilityButton()
-        self.updateOutputEdgesButton()
+            outputModelNode.SetAndObserveMesh(outputPolyData)
+            if not outputModelNode.GetDisplayNode():
+                outputModelNode.CreateDefaultDisplayNodes()
+                outputModelNode.GetDisplayNode().SetColor(0.75, 0.75, 0.75)
+                outputModelNode.GetDisplayNode().SetLineWidth(3)
+            # Table first: it names each face in the legend, and the names are only known now.
+            self.updateFaceColorTable()
+            self.updateOutputFaceColoring()
+            self.updateOutputVisibilityButton()
+            self.updateOutputEdgesButton()
 
-        if self.logic.lastUnclippedPoints:
-            self.ui.clipStatusLabel.text = _("No cut made at: {point_labels}. These points are positioned exactly at, or beyond, the vessel end — move them slightly inward.").format(
-                point_labels=", ".join(self.logic.lastUnclippedPoints))
-            self.ui.clipStatusLabel.styleSheet = "QLabel { color: #d08000; }"
-        elif self.logic.lastPlanarityFailures:
-            failedLabels = [result["label"] for result in self.logic.lastPlanarityFailures]
-            self.ui.clipStatusLabel.text = _("Capping skipped; non-planar cuts: {failed_labels}").format(failed_labels=", ".join(failedLabels))
-            self.ui.clipStatusLabel.styleSheet = "QLabel { color: #d08000; }"
-        else:
-            self.ui.clipStatusLabel.text = _("All cuts are planar.")
-            self.ui.clipStatusLabel.styleSheet = "QLabel { color: #008000; }"
+            if self.logic.lastUnclippedPoints:
+                self.ui.clipStatusLabel.text = _("No cut made at: {point_labels}. These points are positioned exactly at, or beyond, the vessel end — move them slightly inward.").format(
+                    point_labels=", ".join(self.logic.lastUnclippedPoints))
+                self.ui.clipStatusLabel.styleSheet = "QLabel { color: #d08000; }"
+            elif self.logic.lastPlanarityFailures:
+                failedLabels = [result["label"] for result in self.logic.lastPlanarityFailures]
+                self.ui.clipStatusLabel.text = _("Capping skipped; non-planar cuts: {failed_labels}").format(failed_labels=", ".join(failedLabels))
+                self.ui.clipStatusLabel.styleSheet = "QLabel { color: #d08000; }"
+            else:
+                self.ui.clipStatusLabel.text = _("All cuts are planar.")
+                self.ui.clipStatusLabel.styleSheet = "QLabel { color: #008000; }"
 
-    except Exception as e:
-        slicer.util.errorDisplay(_("Failed to compute results: {message}").format(message=str(e)))
-        import traceback
-        traceback.print_exc()
+            # Which face id landed on which cap is the one thing about the labeling that cannot be
+            # read off the 3D view, and it is what a boundary condition setup is written against.
+            if labelModelFaces:
+                parts = ["%d\u2192%d" % item for item in sorted(self.logic.lastExistingFaceIdMap.items())]
+                parts = [_("existing faces {faces}").format(faces=", ".join(parts))] if parts else []
+                if self.logic.lastWallFaceId is not None:
+                    parts.append(_("wall={wall_face_id}").format(wall_face_id=self.logic.lastWallFaceId))
+                parts += ["%d=%s" % assignment for assignment in self.logic.lastFaceIdAssignments]
+                self.ui.clipStatusLabel.text += " %s: %s." % (modelFaceIdArrayName, ", ".join(parts))
+
     finally:
-        qt.QApplication.restoreOverrideCursor()
         self._applying = False
     slicer.util.showStatusMessage(_("Clipping vessel complete."), 3000)
 
@@ -1202,7 +1530,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 # ClipVesselLogic
 #
 
-class ClipVesselLogic(ScriptedLoadableModuleLogic):
+class ClipVesselLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
   """This class should implement all the actual
   computation done by your module.  The interface
   should be such that other python code can import
@@ -1213,6 +1541,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
   """
   def __init__(self):
     ScriptedLoadableModuleLogic.__init__(self)
+    VTKObservationMixin.__init__(self)  # needed to observe the scene closing
     self.radiusArrayName = 'Radius'
 
     # whether to use an adaptive extension length, expressed as a multiple of the boundary's mean radius
@@ -1237,13 +1566,35 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     self.TransitionRatio = 0.25
     # How the original cross-section is blended into the target one. Used when the caller
     # does not specify one.
-    self.InterpolationMode = "RAMP"
-    # whether the extension keeps the cross-sectional shape of the boundary it grows from,
-    # instead of morphing it into a circle
-    self.PreserveCrossSectionShape = False
+    self.TransitionMethod = "RAMP"
+    # whether the extension morphs the cross-section of the boundary it grows from into a
+    # circle, rather than keeping the shape it has
+    self.TransitionToCircularCrossSection = True
     self.CenterlineNormalEstimationDistanceRatio = 1.0
 
+    # Lowest face id the module hands out when face labeling is enabled. Any labels the input
+    # surface already carried are compacted onto firstFaceId, firstFaceId+1, ...; the vessel
+    # wall takes the id after those, and the caps follow it in clip point order.
+    self.firstFaceId = 1
     self.planarityToleranceMm = 0.01
+
+    self.resetRunState()
+    # Everything resetRunState() clears describes the scene it was computed from, so none of it
+    # may outlive that scene: a legend built afterwards would otherwise still carry the face
+    # names of a surface that is gone, and the caches would answer for nodes that no longer
+    # exist.
+    self.addObserver(slicer.mrmlScene, slicer.vtkMRMLScene.EndCloseEvent, self.onSceneEndClose)
+
+  def resetRunState(self):
+    """Forget the last run: what it produced, and what it cached in order to produce it."""
+    # Filled in by labelModelFaces(). lastWallFaceId is None both before any run and when the
+    # input labeled every cell, leaving no wall to label.
+    self.lastWallFaceId = None
+    self.lastExistingFaceIdMap = {}
+    # Filled in by clipVessel() rather than by labelModelFaces(), so a caller that labels a
+    # surface directly leaves whatever the last clip put here -- which is how the cap names of
+    # one run used to turn up in the legend of the next.
+    self.lastFaceIdAssignments = []
     self.lastPlanarityResults = []
     self.lastPlanarityFailures = []
     self.lastUnclippedPoints = []
@@ -1253,6 +1604,15 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     self._centerlineGeometryCache = None
     self._centerlineLocatorCacheKey = None
     self._centerlineLocator = None
+    # The poly data the run labeled, and its modification time as of then. What the run recorded
+    # describes that poly data and nothing else, so this is what makes it possible to tell
+    # whether it still applies to the surface being asked about.
+    self._runStateSurface = None
+    self._runStateSurfaceMTime = None
+
+  def onSceneEndClose(self, caller=None, event=None):
+    """The scene the last run described is gone, so nothing it left behind still applies."""
+    self.resetRunState()
 
   def setDefaultParameters(self, parameterNode):
     """
@@ -1270,27 +1630,59 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         parameterNode.SetParameter("SubdivideInputSurface", "false")
     if not parameterNode.GetParameter("CapOutputSurface"):
         parameterNode.SetParameter("CapOutputSurface", "true")
+    if parameterNode.GetParameter("CapMethod") not in _CAP_METHOD_IDS:
+        parameterNode.SetParameter("CapMethod", _DEFAULT_CAP_METHOD)
+    if not parameterNode.GetParameter("CapConstraintFactor"):
+        parameterNode.SetParameter("CapConstraintFactor", str(_DEFAULT_CAP_CONSTRAINT_FACTOR))
+    if not parameterNode.GetParameter("CapNumberOfRings"):
+        parameterNode.SetParameter("CapNumberOfRings", str(_DEFAULT_CAP_NUMBER_OF_RINGS))
+    if not parameterNode.GetParameter("RemeshCaps"):
+        parameterNode.SetParameter("RemeshCaps", "false")
+    if not parameterNode.GetParameter("CapTargetEdgeLength"):
+        parameterNode.SetParameter("CapTargetEdgeLength", str(_DEFAULT_CAP_TARGET_EDGE_LENGTH))
+    if not parameterNode.GetParameter("LabelModelFaces"):
+        parameterNode.SetParameter("LabelModelFaces", "false")
+    if not parameterNode.GetParameter("ModelFaceIdArrayName"):
+        parameterNode.SetParameter("ModelFaceIdArrayName", _DEFAULT_MODEL_FACE_ID_ARRAY_NAME)
     if not parameterNode.GetParameter("ExtensionRatio"):
         parameterNode.SetParameter("ExtensionRatio", "2")
     if not parameterNode.GetParameter("ExtensionTransitionRatio"):
         parameterNode.SetParameter("ExtensionTransitionRatio", "0.25")
-    # Earlier module versions offered the extension direction and the interpolation method in
-    # a single list, storing both in the ExtensionMode parameter. When an interpolation method
-    # was chosen there, the extension direction was left at the filter default (centerline
-    # direction), so scenes saved that way are migrated accordingly.
-    extensionMode = _normalizedModeId(parameterNode.GetParameter("ExtensionMode"))
-    interpolationMode = _normalizedModeId(parameterNode.GetParameter("InterpolationMode"))
-    if extensionMode in _INTERPOLATION_MODE_IDS:
-        interpolationMode = extensionMode
-        extensionMode = "CENTERLINE_DIRECTION"
-    extensionMode = extensionMode if extensionMode in _EXTENSION_MODE_IDS else "BOUNDARY_NORMAL"
-    interpolationMode = interpolationMode if interpolationMode in _INTERPOLATION_MODE_IDS else "RAMP"
-    if extensionMode != parameterNode.GetParameter("ExtensionMode"):
-        parameterNode.SetParameter("ExtensionMode", extensionMode)
-    if interpolationMode != parameterNode.GetParameter("InterpolationMode"):
-        parameterNode.SetParameter("InterpolationMode", interpolationMode)
-    if not parameterNode.GetParameter("PreserveCrossSectionShape"):
-        parameterNode.SetParameter("PreserveCrossSectionShape", "false")
+    # These two were called ExtensionMode and InterpolationMode before they were named after what
+    # they actually select, so a scene saved by an earlier version is read from the old names
+    # when the current ones are not there yet. Earlier still, both were offered in a single list
+    # and stored together in ExtensionMode; when a transition method was chosen there, the
+    # extension direction was left at the filter default (centerline direction), so a scene saved
+    # that way is migrated accordingly.
+    legacyExtensionMode = parameterNode.GetParameter("ExtensionMode")
+    legacyInterpolationMode = parameterNode.GetParameter("InterpolationMode")
+    extensionDirection = _normalizedOptionId(
+        parameterNode.GetParameter("ExtensionDirection") or legacyExtensionMode)
+    transitionMethod = _normalizedOptionId(
+        parameterNode.GetParameter("TransitionMethod") or legacyInterpolationMode)
+    if extensionDirection in _TRANSITION_METHOD_IDS:
+        transitionMethod = extensionDirection
+        extensionDirection = "CENTERLINE_DIRECTION"
+    extensionDirection = extensionDirection if extensionDirection in _EXTENSION_DIRECTION_IDS else "BOUNDARY_NORMAL"
+    transitionMethod = transitionMethod if transitionMethod in _TRANSITION_METHOD_IDS else "RAMP"
+    if extensionDirection != parameterNode.GetParameter("ExtensionDirection"):
+        parameterNode.SetParameter("ExtensionDirection", extensionDirection)
+    if transitionMethod != parameterNode.GetParameter("TransitionMethod"):
+        parameterNode.SetParameter("TransitionMethod", transitionMethod)
+    for legacyName in ("ExtensionMode", "InterpolationMode"):
+        if parameterNode.GetParameter(legacyName):
+            parameterNode.UnsetParameter(legacyName)
+    # Earlier module versions stored this the other way round, as PreserveCrossSectionShape, so
+    # a scene saved by one of those is carried over inverted rather than silently taking the
+    # default and morphing an end whose shape was meant to be kept.
+    legacyPreserveCrossSectionShape = parameterNode.GetParameter("PreserveCrossSectionShape")
+    if legacyPreserveCrossSectionShape:
+        if not parameterNode.GetParameter("TransitionToCircularCrossSection"):
+            parameterNode.SetParameter("TransitionToCircularCrossSection",
+                                       "false" if legacyPreserveCrossSectionShape == "true" else "true")
+        parameterNode.UnsetParameter("PreserveCrossSectionShape")
+    if not parameterNode.GetParameter("TransitionToCircularCrossSection"):
+        parameterNode.SetParameter("TransitionToCircularCrossSection", "true")
     if not parameterNode.GetParameter("ManualClipPlaneNormals"):
         parameterNode.SetParameter("ManualClipPlaneNormals", "{}")
     if not parameterNode.GetParameter("ManualClipPlaneOrigins"):
@@ -1326,15 +1718,602 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         logging.error("Surface can only be loaded from model or segmentation node")
         return None
             
-  def capSurface(self, surface):
-    capDisplacement = 0.0
-    surfaceCapper = vtkvmtkComputationalGeometry.vtkvmtkCapPolyData()
-    surfaceCapper.SetInputData(surface)
-    surfaceCapper.SetDisplacement(capDisplacement)
-    surfaceCapper.SetInPlaneDisplacement(capDisplacement)
+  @staticmethod
+  def triangulateSurface(surface):
+    """The surface with every cell split into triangles. Cell data is carried over to each
+    triangle a cell is split into, so cell arrays survive."""
+    triangleFilter = vtk.vtkTriangleFilter()
+    triangleFilter.SetInputData(surface)
+    triangleFilter.PassLinesOff()
+    triangleFilter.PassVertsOff()
+    triangleFilter.Update()
+    return triangleFilter.GetOutput()
+
+  @staticmethod
+  def orientSurfaceOutwards(surface):
+    """The surface with every cell wound so that its normal points out of the enclosed volume,
+    and with any normals array dropped. Two things about the capped surface would otherwise be
+    shaded wrongly, and the cappers differ in which of them they get right:
+      - the simple and smooth cappers wind their cap cells the opposite way round from the
+        vessel wall (the center point capper does not), so the caps come out lit from inside;
+      - the simple capper is the only one that carries the point data of the input over to its
+        output, and since it closes a boundary without adding any point, every vertex of its cap
+        is a boundary vertex whose normal is the one the vessel wall left there. The cap is then
+        shaded as though it were wall - the normals do not even face the same way across it.
+    Dropping the normals leaves the renderer to shade the surface by its geometry, which is what
+    it already does for the other two cappers. The cells keep their order, so cell arrays still
+    line up. Assumes the surface is closed, as it is once capped.
+    """
+    normalsFilter = vtk.vtkPolyDataNormals()
+    normalsFilter.SetInputData(surface)
+    # The consistency pass is what re-winds the cells, and the filter only runs it when it has
+    # normals to compute; the cell normals are the cheaper of the two and are dropped again.
+    normalsFilter.ComputePointNormalsOff()
+    normalsFilter.ComputeCellNormalsOn()
+    normalsFilter.ConsistencyOn()
+    normalsFilter.AutoOrientNormalsOn()
+    normalsFilter.SplittingOff()
+    normalsFilter.Update()
+    surface = normalsFilter.GetOutput()
+    for attributes in (surface.GetPointData(), surface.GetCellData()):
+        attributes.SetNormals(None)
+        attributes.RemoveArray("Normals")
+    return surface
+
+  def capSurface(self, surface, cellEntityIdsArrayName=None, cellEntityIdOffset=0,
+                 capMethod=_DEFAULT_CAP_METHOD,
+                 constraintFactor=_DEFAULT_CAP_CONSTRAINT_FACTOR,
+                 numberOfRings=_DEFAULT_CAP_NUMBER_OF_RINGS):
+    """Close every open boundary of the surface. capMethod picks the shape of the cap mesh, one
+    VMTK capping filter each:
+      "CENTERPOINT" - a fan of triangles from the barycenter of the hole (vtkvmtkCapPolyData)
+      "SIMPLE"      - a flat fill of the hole that adds no points (vtkvmtkSimpleCapPolyData)
+      "SMOOTH"      - a cap of concentric rings of cells (vtkvmtkSmoothCapPolyData);
+                      constraintFactor sets how far it bulges out of the plane of the cut,
+                      following the shape of the surface at the rim (0 keeps it in the plane),
+                      and numberOfRings how finely it is meshed
+    Whichever method is used, the output is triangulated, consistently oriented outwards and
+    free of the stale normals that would otherwise shade the caps wrongly.
+
+    When cellEntityIdsArrayName is set, the filter also tags each cell in a cell array of that
+    name: input cells get cellEntityIdOffset, and the cap closing the i-th boundary gets
+    i+1+cellEntityIdOffset. Caution: if the input already carries that array the filter keeps
+    its values but still numbers the caps from cellEntityIdOffset up, so new cap ids land on ids
+    already in use - clipVessel() passes a private array name for that reason.
+
+    Each cap takes the label of the boundary it closes, which is the index of the clip point
+    that opened it (see labelClipBoundaries), so a cap can be traced back to its cut without
+    anything having to be numbered or translated. All three cappers read the labels, so that
+    holds whichever method is chosen. A hole no cut opened carries no label, and its cap keeps
+    the i+1+cellEntityIdOffset the capper derives from the extraction order - which is why the
+    offset has to sit above every clip point index.
+
+    Caution: the simple and smooth cappers need a triangulated input to leave the cells of the
+    input alone (see _CAP_METHODS_NEEDING_TRIANGLES); callers that match cells of the output up
+    with cells of the input must triangulate before calling.
+    """
+    if capMethod not in _CAP_METHOD_IDS:
+        logging.warning("Unknown cap method %s, capping with %s instead.", capMethod, _DEFAULT_CAP_METHOD)
+        capMethod = _DEFAULT_CAP_METHOD
+
+    if capMethod == "CENTERPOINT":
+        capDisplacement = 0.0
+        surfaceCapper = vtkvmtkComputationalGeometry.vtkvmtkCapPolyData()
+        surfaceCapper.SetInputData(surface)
+        surfaceCapper.SetDisplacement(capDisplacement)
+        surfaceCapper.SetInPlaneDisplacement(capDisplacement)
+    else:
+        import vtkvmtkMiscPython as vtkvmtkMisc
+        if capMethod == "SIMPLE":
+            surfaceCapper = vtkvmtkMisc.vtkvmtkSimpleCapPolyData()
+        else:
+            surfaceCapper = vtkvmtkMisc.vtkvmtkSmoothCapPolyData()
+            surfaceCapper.SetConstraintFactor(constraintFactor)
+            surfaceCapper.SetNumberOfRings(max(2, int(numberOfRings)))
+        surfaceCapper.SetInputData(surface)
+
+    # Read the boundaries from the labels rather than extracting them again, which is what makes
+    # a boundary id here mean the clip point that opened it. Every capper reads them, so the
+    # choice of method does not change which cut a cap is named after. A surface that does not
+    # carry them is not one this module produced: the filter says so and falls back to its own
+    # numbering, rather than this module quietly identifying boundaries by extraction order.
+    surfaceCapper.SetBoundaryLabelsArrayName(self.boundaryLabelsArrayName)
+    surfaceCapper.SetBoundaryPointOrderArrayName(self.boundaryPointOrderArrayName)
+
+    if cellEntityIdsArrayName:
+        surfaceCapper.SetCellEntityIdsArrayName(cellEntityIdsArrayName)
+        surfaceCapper.SetCellEntityIdOffset(cellEntityIdOffset)
     surfaceCapper.Update()
     surface = surfaceCapper.GetOutput()
+
+    if capMethod in _CAP_METHODS_NEEDING_TRIANGLES:
+        # The caps are polygons (simple) or quads (smooth); the rest of the pipeline, and
+        # anything reading the output as a surface mesh, expects triangles throughout.
+        surface = self.triangulateSurface(surface)
+
+    # Two of the three cappers wind their caps inwards; a no-op for the third.
+    surface = self.orientSurfaceOutwards(surface)
+
     return surface
+
+  # Carries the capping filter's per-boundary ids from capSurface() to labelModelFaces(). The
+  # name must be one no input surface uses, or the filter inherits its values (see capSurface).
+  capBoundaryIdsArrayName = "__ClipVesselCapBoundaryIds"
+
+  # Carry which clip point opened which boundary through the filters that rebuild the mesh, in the
+  # surface's own point data (see labelClipBoundaries). Private names, so that a surface the user
+  # brought in with arrays of its own cannot be mistaken for a labeled one.
+  boundaryLabelsArrayName = "__ClipVesselBoundaryLabels"
+  boundaryPointOrderArrayName = "__ClipVesselBoundaryPointOrder"
+
+  def capTargetArea(self, surface, entityIds, capEntityId, targetEdgeLength=0.0):
+    """The triangle area a uniform mesh of the cap carrying capEntityId should aim for.
+
+    A given edge length asks for the equilateral triangle of that side. Otherwise the cap is
+    sized after the cells the surface has around its own rim - those sharing a point with it -
+    so that each cap is meshed as finely as the vessel it closes, rather than every cap in the
+    surface being meshed alike.
+
+    None if the cap has no cells, which leaves it to be skipped.
+    """
+    if targetEdgeLength > 0.0:
+        return float(np.sqrt(3.0) / 4.0 * targetEdgeLength ** 2)
+
+    capCellIds = np.nonzero(entityIds == capEntityId)[0]
+    if capCellIds.size == 0:
+        return None
+
+    surface.BuildLinks()
+    pointIds = vtk.vtkIdList()
+    cellIds = vtk.vtkIdList()
+    rimNeighbourIds = set()
+    for capCellId in capCellIds:
+        surface.GetCellPoints(int(capCellId), pointIds)
+        for pointIndex in range(pointIds.GetNumberOfIds()):
+            surface.GetPointCells(pointIds.GetId(pointIndex), cellIds)
+            for neighbourIndex in range(cellIds.GetNumberOfIds()):
+                neighbourId = int(cellIds.GetId(neighbourIndex))
+                if entityIds[neighbourId] != capEntityId:
+                    rimNeighbourIds.add(neighbourId)
+
+    # A cap with nothing around it - the whole surface is that one cap - has only itself to go by.
+    areaCellIds = rimNeighbourIds if rimNeighbourIds else set(int(value) for value in capCellIds)
+    areas = [surface.GetCell(cellId).ComputeArea() for cellId in areaCellIds]
+    areas = [area for area in areas if area > 0.0]
+    if not areas:
+        return None
+    return float(np.mean(areas))
+
+  # Passes the remesher makes over a cap. Each one splits, collapses, flips and relocates once;
+  # VMTK's own remeshing script defaults to ten, but a cap is a small, nearly flat patch and
+  # eight passes already even it out - the further two only cost time.
+  capRemeshingIterations = 8
+
+  # Rings of cells kept around a cap when it is remeshed (see remeshCaps). One would do to make
+  # the rim an entity boundary; a second costs almost nothing and leaves every cell that touches
+  # the rim with a complete ring of neighbours of its own.
+  capRemeshingCollarRings = 2
+
+  @staticmethod
+  def extractCells(surface, cellMask):
+    """The cells of the surface that cellMask selects, as a surface of their own, carrying the
+    cell data of the ones they came from."""
+    maskArrayName = "__ClipVesselExtractCells"
+    maskArray = numpy_to_vtk(np.asarray(cellMask, dtype=np.int8), deep=True,
+                             array_type=vtk.VTK_SIGNED_CHAR)
+    maskArray.SetName(maskArrayName)
+    # Carried on a copy of the surface rather than on the surface itself. The caller may well
+    # hand in a filter's output, and adding an array to one of those marks it modified: the
+    # filter that made it runs again on the next update and hands back a fresh output without
+    # the array, leaving nothing to threshold on and dropping the cell data being extracted.
+    masked = vtk.vtkPolyData()
+    masked.ShallowCopy(surface)
+    masked.GetCellData().AddArray(maskArray)
+
+    threshold = vtk.vtkThreshold()
+    threshold.SetInputData(masked)
+    threshold.SetInputArrayToProcess(0, 0, 0, vtk.vtkDataObject.FIELD_ASSOCIATION_CELLS,
+                                     maskArrayName)
+    threshold.SetLowerThreshold(0.5)
+    threshold.SetUpperThreshold(1.5)
+    threshold.Update()
+    geometryFilter = vtk.vtkGeometryFilter()
+    geometryFilter.SetInputData(threshold.GetOutput())
+    geometryFilter.Update()
+
+    extracted = vtk.vtkPolyData()
+    extracted.DeepCopy(geometryFilter.GetOutput())
+    extracted.GetCellData().RemoveArray(maskArrayName)
+    return extracted
+
+  def cellNeighbourhood(self, surface, cellMask, rings):
+    """A mask over the cells of the surface covering the ones cellMask selects and the given
+    number of rings of cells around them, a ring being everything sharing a point with the last."""
+    surface.BuildLinks()
+    selected = np.asarray(cellMask, dtype=bool).copy()
+    frontier = np.nonzero(selected)[0]
+    pointIds, cellIds = vtk.vtkIdList(), vtk.vtkIdList()
+    for _ in range(rings):
+        nextFrontier = []
+        for cellId in frontier:
+            surface.GetCellPoints(int(cellId), pointIds)
+            for pointIndex in range(pointIds.GetNumberOfIds()):
+                surface.GetPointCells(pointIds.GetId(pointIndex), cellIds)
+                for neighbourIndex in range(cellIds.GetNumberOfIds()):
+                    neighbour = int(cellIds.GetId(neighbourIndex))
+                    if not selected[neighbour]:
+                        selected[neighbour] = True
+                        nextFrontier.append(neighbour)
+        if not nextFrontier:
+            break
+        frontier = nextFrontier
+    return selected
+
+  def remeshCaps(self, surface, cellEntityIdsArrayName, capEntityIds,
+                 targetEdgeLength=_DEFAULT_CAP_TARGET_EDGE_LENGTH):
+    """The surface with the cells of each of capEntityIds retriangulated to a uniform point
+    distribution, leaving every other cell of the surface untouched.
+
+    Every capper meshes a boundary by following its rim rather than the area it spans: the center
+    point capper makes a fan of slivers meeting at a single interior point, the simple capper
+    adds no interior point at all, and the rings of a smooth cap crowd together towards its
+    middle. This puts the cap cells - and only those - through VMTK's surface remesher, which
+    splits, collapses and flips them until they are near equilateral and of an even size.
+
+    The remesher edits no cell of an excluded entity and moves no point that one of them uses, so
+    the vessel wall comes through unchanged and the cap goes on sharing the rim with it, still
+    watertight and point for point. That also fixes the spacing of the rim itself: it is the
+    interior of the cap that is made uniform, while its rim keeps the spacing the wall gives it.
+
+    Each cap is remeshed on a neighbourhood of itself - the cap plus a collar of the cells around
+    it - rather than on the whole surface, and the pieces are put back together at the end. The
+    remesher walks every cell and every point of its input on each of its iterations whether it
+    may edit them or not, so handing it the whole vessel to retouch a few hundred cap cells costs
+    the best part of ten times what handing it the neighbourhood does, for the same result. The
+    collar is what makes that safe: it is excluded like the rest of the wall was, so the rim stays
+    a boundary between two entities and its points stay frozen, and it comes back untouched, which
+    is what lets the remeshed cap be stitched back on to a rim that still matches point for point.
+    Remeshing a cap on its own instead would not do - the rim would then be an open boundary, and
+    PreserveBoundaryEdges stops the remesher editing boundary edges but not relocating the points
+    on them, so the rim would come back moved and the cap would no longer meet the wall.
+
+    :param cellEntityIdsArrayName: cell array naming the face each cell belongs to. Its values
+      must not be negative: the remesher reads -1 as "no entity", and would then stop reading the
+      rim as a boundary between two faces - which is what stops it pulling the cap off the wall.
+    :param capEntityIds: the values in that array that name the caps to remesh.
+    :param targetEdgeLength: edge length to aim for, in mm; 0 sizes each cap after the surface
+      around its rim (see capTargetArea).
+    :return: the remeshed surface. Caution: the mesh is rebuilt around the caps, so the cells come
+      back neither the same in number nor in the same order, and only cellEntityIdsArrayName
+      survives - the remesher keeps no other cell data, and no point data.
+    """
+    import vtkvmtkDifferentialGeometryPython as vtkvmtkDifferentialGeometry
+
+    capEntityIds = [int(value) for value in capEntityIds]
+    if not capEntityIds:
+        return surface
+
+    # The remesher reads its input as triangles and stops on anything else.
+    surface = self.triangulateSurface(surface)
+
+    entityIdsArray = surface.GetCellData().GetArray(cellEntityIdsArrayName)
+    if entityIdsArray is None or entityIdsArray.GetNumberOfTuples() != surface.GetNumberOfCells():
+        logging.warning("Clip Vessel skipped remeshing the caps: the surface carries no usable %s "
+                        "cell array to tell them apart by.", cellEntityIdsArrayName)
+        return surface
+    entityIds = vtk_to_numpy(entityIdsArray).astype(np.int64)
+
+    remeshedCaps = []
+    remeshedCapEntityIds = []
+    for capEntityId in capEntityIds:
+        capCellMask = entityIds == capEntityId
+        targetArea = self.capTargetArea(surface, entityIds, capEntityId, targetEdgeLength)
+        if targetArea is None or not capCellMask.any():
+            continue
+
+        neighbourhood = self.extractCells(
+            surface, self.cellNeighbourhood(surface, capCellMask, self.capRemeshingCollarRings))
+        neighbourhoodIdsArray = neighbourhood.GetCellData().GetArray(cellEntityIdsArrayName)
+        if neighbourhoodIdsArray is None:
+            continue
+        neighbourhoodIds = vtk_to_numpy(neighbourhoodIdsArray).astype(np.int64)
+
+        # Everything but this cap - the collar included - is left to the remesher as it is, which
+        # is what freezes the rim. One pass per cap, because TargetArea is a single value for a
+        # run: sizing every cap by one number would mesh a cap on a small branch as coarsely as
+        # one on the aorta.
+        excludedEntityIds = vtk.vtkIdList()
+        for entityId in np.unique(neighbourhoodIds):
+            if int(entityId) != capEntityId:
+                excludedEntityIds.InsertNextId(int(entityId))
+
+        remesher = vtkvmtkDifferentialGeometry.vtkvmtkPolyDataSurfaceRemeshing()
+        remesher.SetInputData(neighbourhood)
+        remesher.SetCellEntityIdsArrayName(cellEntityIdsArrayName)
+        remesher.SetExcludedEntityIds(excludedEntityIds)
+        remesher.SetElementSizeModeToTargetArea()
+        remesher.SetTargetArea(targetArea)
+        remesher.SetNumberOfIterations(self.capRemeshingIterations)
+        # PreserveBoundaryEdges is for open boundaries, and the collar leaves the cap without any.
+        # The rim is held by the entity ids instead: the remesher never edits across a boundary
+        # between two entities, whether that flag is set or not.
+        remesher.Update()
+        remeshedNeighbourhood = remesher.GetOutput()
+
+        remeshedNeighbourhoodIdsArray = remeshedNeighbourhood.GetCellData().GetArray(cellEntityIdsArrayName)
+        if remeshedNeighbourhoodIdsArray is None:
+            continue
+        # Only the cap is taken back; the collar came in as part of the wall and is still there.
+        remeshedIds = vtk_to_numpy(remeshedNeighbourhoodIdsArray).astype(np.int64)
+        remeshedCaps.append(self.extractCells(remeshedNeighbourhood, remeshedIds == capEntityId))
+        remeshedCapEntityIds.append(capEntityId)
+
+    if not remeshedCaps:
+        return surface
+
+    # The surface with the old caps cut out, and the remeshed ones put in their place. Their rim
+    # points were never moved, so they still coincide exactly with the ones left around the holes
+    # and merging brings the two back together into one watertight surface.
+    pieces = [self.extractCells(surface, ~np.isin(entityIds, remeshedCapEntityIds))] + remeshedCaps
+    appendFilter = vtk.vtkAppendPolyData()
+    pieceEntityIds = []
+    for piece in pieces:
+        appendFilter.AddInputData(piece)
+        pieceArray = piece.GetCellData().GetArray(cellEntityIdsArrayName)
+        pieceEntityIds.append(vtk_to_numpy(pieceArray).astype(np.int64) if pieceArray is not None
+                              else np.zeros(piece.GetNumberOfCells(), np.int64))
+    appendFilter.Update()
+    appended = appendFilter.GetOutput()
+
+    # Put the ids back by hand. The append carries a cell array through only when every input has
+    # it under the same name and of the same type, and these do not: the capper writes the ids as
+    # a vtkIdTypeArray and the remesher writes them as a vtkIntArray, so the array is dropped
+    # without a word. Rebuilding it is exact anyway - the filter appends cells in input order.
+    appendedEntityIds = np.concatenate(pieceEntityIds) if pieceEntityIds else np.zeros(0, np.int64)
+    if appendedEntityIds.size == appended.GetNumberOfCells():
+        appendedArray = numpy_to_vtk(appendedEntityIds.astype(np.int32), deep=True,
+                                     array_type=vtk.VTK_INT)
+        appendedArray.SetName(cellEntityIdsArrayName)
+        appended.GetCellData().RemoveArray(cellEntityIdsArrayName)
+        appended.GetCellData().AddArray(appendedArray)
+    else:
+        logging.warning("Clip Vessel could not carry the %s ids across the remeshed caps: %d ids "
+                        "for %d cells.", cellEntityIdsArrayName, appendedEntityIds.size,
+                        appended.GetNumberOfCells())
+
+    cleanFilter = vtk.vtkCleanPolyData()
+    cleanFilter.SetInputData(appended)
+    cleanFilter.PointMergingOn()
+    # Only points that are already in the same place, which the rim points of the two pieces are.
+    # A tolerance relative to the bounding box would pull the finer cells of a cap together.
+    cleanFilter.ToleranceIsAbsoluteOn()
+    cleanFilter.SetAbsoluteTolerance(0.0)
+    # A cell that came out degenerate stays a degenerate triangle rather than turning into a line
+    # or a vert, which would leave cells the face labels do not line up with (see clipVessel).
+    cleanFilter.ConvertPolysToLinesOff()
+    cleanFilter.ConvertLinesToPointsOff()
+    cleanFilter.ConvertStripsToPolysOff()
+    cleanFilter.Update()
+
+    # The remesher rebuilds the cap cells, so their winding is its own rather than the one the
+    # capper left consistent with the wall.
+    return self.orientSurfaceOutwards(cleanFilter.GetOutput())
+
+  def surroundingFaceId(self, surface, capCellIndices, faceIds, isCapCell, fallbackFaceId):
+    """The commonest face id among the cells around the hole this cap closed, so that a fill over
+    a mesh defect joins the face it sits in instead of becoming a boundary of its own."""
+    surface.BuildLinks()
+    pointIds = vtk.vtkIdList()
+    cellIds = vtk.vtkIdList()
+    neighbourFaceIds = []
+    for cellIndex in capCellIndices:
+        surface.GetCellPoints(int(cellIndex), pointIds)
+        for pointIndex in range(pointIds.GetNumberOfIds()):
+            surface.GetPointCells(pointIds.GetId(pointIndex), cellIds)
+            for neighbourIndex in range(cellIds.GetNumberOfIds()):
+                neighbour = int(cellIds.GetId(neighbourIndex))
+                if not isCapCell[neighbour]:
+                    neighbourFaceIds.append(int(faceIds[neighbour]))
+    if not neighbourFaceIds:
+        return fallbackFaceId
+    values, counts = np.unique(neighbourFaceIds, return_counts=True)
+    return int(values[np.argmax(counts)])
+
+  def labelModelFaces(self, surface, planeSpecifications, faceIdArrayName, existingFaceIds=None,
+                      wallCellEntityId=0):
+    """Tag every cell of the output surface with an integer face id, in the faceIdArrayName cell
+    data array, so that a CFD setup can assign a boundary condition per face and a remesher can
+    keep the wall/cap boundaries as sharp feature edges.
+
+    Layout: any face the input already carried (a non-positive id counts as unlabeled) is
+    renumbered onto firstFaceId, firstFaceId+1, ... in ascending order of its original id; the
+    vessel wall - every cell left unlabeled, flow extensions included - takes the next id, unless
+    the input labeled every cell and there is no wall; then the caps, in clip point order. With
+    nothing pre-existing that is just wall=1, caps=2,3,...
+
+    Caps follow the clip points rather than the capping filter's own boundary order, which
+    shifts as clip points move and would renumber the faces of a configured simulation between
+    runs. Which cap belongs to which clip point is settled by labelClipBoundaries(), which writes
+    the clip point's index onto the points of the boundary it opened; the capper reads those
+    labels and puts the clip point's id on the cap closing each. A clip point that made no cut
+    leaves its id unused rather than shifting the others.
+
+    :param existingFaceIds: the ids the input carried, one per input cell, in cell order;
+      clipVessel reads them before capping, which does not carry cell data through. When None
+      they are read off the surface, which is only correct if it has not been capped since.
+    :param wallCellEntityId: the value the capping filter left on the cells it copied from its
+      input, which is what tells a cap cell from a wall cell. A cap carries the id of the clip point
+      whose cut opened the boundary it closes (i+1 for clip point i); a cap closing a boundary no cut
+      opened carries an id the capper derived itself, which falls outside that range.
+    :return: [(faceId, clipPointLabel)] for the caps. lastWallFaceId and lastExistingFaceIdMap
+      describe the rest.
+    """
+    numberOfCells = surface.GetNumberOfCells()
+
+    # The capping filter writes 0 for cells that came from its input and i+1 for the cap that
+    # closed boundary i - the only thing that tells a new cap cell from a pre-existing one.
+    capBoundaryArray = surface.GetCellData().GetArray(self.capBoundaryIdsArrayName)
+    capBoundaryIds = (vtk_to_numpy(capBoundaryArray).astype(np.int64)
+                      if capBoundaryArray is not None
+                      and capBoundaryArray.GetNumberOfTuples() == numberOfCells else None)
+
+    if existingFaceIds is None:
+        # Direct caller that has not been through clipVessel.
+        existingArray = surface.GetCellData().GetArray(faceIdArrayName)
+        if existingArray is not None and existingArray.GetNumberOfTuples() == numberOfCells:
+            existingFaceIds = vtk_to_numpy(existingArray)
+    existingFaceIds = (np.zeros(0, np.int64) if existingFaceIds is None
+                       else np.asarray(existingFaceIds, dtype=np.int64))
+    # The capper writes wallCellEntityId on the cells it copied from its input and something else
+    # on every cap cell, whether that is a clip point id carried on the boundary or an id derived
+    # from the boundary's position in the capper's own list.
+    isCapCell = (capBoundaryIds != wallCellEntityId) if capBoundaryIds is not None else np.zeros(numberOfCells, bool)
+    nonCapCellCount = int(np.count_nonzero(~isCapCell))
+    if existingFaceIds.size and existingFaceIds.size != nonCapCellCount:
+        # They are matched to output cells by index, so a count mismatch means they would land
+        # on the wrong cells. Drop them rather than smear them.
+        logging.warning("Clip Vessel ignored the %d face labels the input carried: the output has %d "
+                        "non-cap cells, so they cannot be matched up cell for cell.",
+                        existingFaceIds.size, nonCapCellCount)
+        existingFaceIds = np.zeros(0, np.int64)
+
+    # Faces the input already carried, compacted onto firstFaceId, firstFaceId+1, ...
+    # existingFaceIds covers only the input cells; capping appends the cap cells after them.
+    compactedIds = np.zeros(numberOfCells, dtype=np.int64)
+    existingFaceIdMap = {}
+    inputFaceIds = existingFaceIds[:min(existingFaceIds.size, numberOfCells)]
+    compactedHead = compactedIds[:inputFaceIds.size]
+    for compacted, originalId in enumerate(
+            sorted(int(value) for value in np.unique(inputFaceIds) if int(value) > 0),
+            start=self.firstFaceId):
+        existingFaceIdMap[originalId] = compacted
+        compactedHead[inputFaceIds == originalId] = compacted
+
+    # The wall is every cell left unlabeled. An input that labels every cell has no wall, and
+    # then no id is set aside for one, or the caps would start past a face that does not exist.
+    wallFaceId = self.firstFaceId + len(existingFaceIdMap)
+    faceIds = np.where(compactedIds > 0, compactedIds, wallFaceId)
+    hasWallCells = bool(np.any((compactedIds == 0) & ~isCapCell))
+    firstCapFaceId = wallFaceId + 1 if hasWallCells else wallFaceId
+
+    # Caps, numbered in clip point order.
+    capAssignments = []
+    if capBoundaryIds is not None:
+        boundaryIds = [int(value) for value in np.unique(capBoundaryIds[isCapCell])]
+
+        # Each cap carries the id of the clip point whose cut opened the boundary it closes, put
+        # there by clipModel() and brought this far by the capper; a cap value outside the clip
+        # point range belongs to a hole no cut accounts for.
+        numberOfClipPoints = len(planeSpecifications)
+        faceIdByBoundaryId = {}
+        for boundaryId in boundaryIds:
+            if 0 <= boundaryId < numberOfClipPoints:
+                faceIdByBoundaryId[boundaryId] = firstCapFaceId + boundaryId
+
+        labelByPointIndex = {specification["index"]: specification["label"]
+                             for specification in planeSpecifications}
+        unaccountedCaps = []
+        for boundaryId in boundaryIds:
+            capCellIndices = np.nonzero(capBoundaryIds == boundaryId)[0]
+            faceId = faceIdByBoundaryId.get(boundaryId)
+            if faceId is None:
+                # No clip point made this hole, so it is a mesh defect rather than a vessel end -
+                # a single missing triangle leaves a three point boundary. The fill joins the
+                # face it sits in instead of becoming a boundary condition surface of its own.
+                faceId = self.surroundingFaceId(surface, capCellIndices, faceIds, isCapCell, wallFaceId)
+                unaccountedCaps.append((len(capCellIndices), faceId))
+                faceIds[capCellIndices] = faceId
+                continue
+            faceIds[capCellIndices] = faceId
+            capAssignments.append(
+                (faceId, labelByPointIndex.get(faceId - firstCapFaceId, _("unmatched boundary"))))
+        capAssignments.sort(key=lambda assignment: assignment[0])
+        if unaccountedCaps:
+            logging.warning("Clip Vessel closed %d hole(s) that no clip point accounts for, most likely "
+                            "defects in the input mesh; each was given the face id of the surface around "
+                            "it rather than a face of its own (%s). Put a clip point on one of these if "
+                            "it should be its own face.",
+                            len(unaccountedCaps),
+                            ", ".join("%d cells -> face %d" % (cellCount, faceId)
+                                      for cellCount, faceId in unaccountedCaps))
+
+    self.lastWallFaceId = wallFaceId if hasWallCells else None
+    self.lastExistingFaceIdMap = existingFaceIdMap
+
+    faceIdArray = numpy_to_vtk(faceIds.astype(np.int32), deep=True, array_type=vtk.VTK_INT)
+    faceIdArray.SetName(faceIdArrayName)
+    surface.GetCellData().RemoveArray(faceIdArrayName)
+    surface.GetCellData().AddArray(faceIdArray)
+    surface.GetCellData().RemoveArray(self.capBoundaryIdsArrayName)   # internal bookkeeping
+    # Active scalars so the model can be colored by face without picking the array by hand.
+    surface.GetCellData().SetActiveScalars(faceIdArrayName)
+    self.rememberRunStateSurface(surface)
+    return capAssignments
+
+  def rememberRunStateSurface(self, surface):
+    """Record that what the run state holds describes surface, as it stands now."""
+    self._runStateSurface = surface
+    self._runStateSurfaceMTime = surface.GetMTime() if surface is not None else None
+
+  def runStateDescribes(self, surface):
+    """Whether what the last run recorded still describes surface.
+
+    The face ids a run hands out mean something only for the poly data it labeled: they say
+    nothing about another surface that happens to carry the same array, and nothing about this
+    one either once something has changed it. Identity alone is not enough, so the modification
+    time is checked too."""
+    if surface is None or self._runStateSurface is None:
+        return False
+    return surface is self._runStateSurface and surface.GetMTime() == self._runStateSurfaceMTime
+
+  def lastFaceIdLayout(self, surface):
+    """The faces of the last labelModelFaces() call as an ordered [(faceId, name)] - the input's
+    own labels, then the wall, then the caps - so the legend can name them.
+
+    Empty unless the run still describes surface, so that a legend is never named after a run
+    that produced something else."""
+    if not self.runStateDescribes(surface):
+        return []
+    layout = [(newId, _("Input face {original_id}").format(original_id=originalId))
+              for originalId, newId in sorted(self.lastExistingFaceIdMap.items(), key=lambda item: item[1])]
+    if self.lastWallFaceId is not None:
+        layout.append((self.lastWallFaceId, _("Wall")))
+    layout.extend(self.lastFaceIdAssignments)
+    return layout
+
+  def transferFaceLabels(self, sourcePolyData, targetPolyData, faceIdArrayName):
+    """Give every cell of targetPolyData the face id of the nearest cell of sourcePolyData.
+
+    Preprocessing rebuilds the mesh and what it leaves of an existing cell array cannot be
+    relied on: decimation drops it outright, and a degenerate triangle - which vtkCleanPolyData
+    turns into a vert and vtkTriangleFilter then drops - leaves it at twice the cell count and
+    misaligned, so the labels come through scrambled rather than missing. Taking them off the
+    original surface by position is independent of all that.
+    """
+    sourceArray = sourcePolyData.GetCellData().GetArray(faceIdArrayName) if sourcePolyData else None
+    if (sourceArray is None or targetPolyData is None
+            or sourceArray.GetNumberOfTuples() != sourcePolyData.GetNumberOfCells()
+            or targetPolyData.GetNumberOfCells() == 0):
+        return
+    sourceFaceIds = vtk_to_numpy(sourceArray)
+    sourceCenters = vtk.vtkCellCenters()
+    sourceCenters.SetInputData(sourcePolyData)
+    sourceCenters.Update()
+    targetCenters = vtk.vtkCellCenters()
+    targetCenters.SetInputData(targetPolyData)
+    targetCenters.Update()
+    sourceCentroids = vtk.vtkPolyData()
+    sourceCentroids.SetPoints(sourceCenters.GetOutput().GetPoints())
+    locator = vtk.vtkStaticPointLocator()
+    locator.SetDataSet(sourceCentroids)
+    locator.BuildLocator()
+    transferred = np.empty(targetPolyData.GetNumberOfCells(), dtype=np.int32)
+    for cellIndex, center in enumerate(vtk_to_numpy(targetCenters.GetOutput().GetPoints().GetData())):
+        transferred[cellIndex] = sourceFaceIds[locator.FindClosestPoint(center)]
+    faceIdArray = numpy_to_vtk(transferred, deep=True, array_type=vtk.VTK_INT)
+    faceIdArray.SetName(faceIdArrayName)
+    targetPolyData.GetCellData().RemoveArray(faceIdArrayName)
+    targetPolyData.GetCellData().AddArray(faceIdArray)
 
   def preprocess(self, inputSurfacePolyData, targetNumberOfPoints, decimationAggressiveness, subdivideInputSurface):
     import ExtractCenterline
@@ -1420,6 +2399,62 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     normal = self.orientNormalTowardBranchEnd(centerlines, centerlines.GetPoint(pointId), normal)
     vtk.vtkMath.Normalize(normal)
     return normal
+
+  def labelClipBoundaries(self, surface, planeSpecifications, tolerance=None):
+    """Label each open boundary of the clipped surface with the index of the clip point that opened it.
+
+    A boundary is attributed to a clip point only when *every* one of its points lies in that clip
+    point's plane, so a hole the input already had, or another cut's boundary, cannot be claimed by
+    the wrong plane. This is the same measurement validateClipPlanes() makes, against the same
+    tolerance: a cut that is not planar to within planarityToleranceMm is reported there and turns
+    capping off, so a boundary too far out of plane to be recognised here is one that would not
+    have been capped anyway.
+
+    The answer is written into the surface's own point data rather than returned as a position in
+    a list, which is what lets it survive the filters that follow. Growing a flow extension
+    replaces a boundary with a new one at the tip of the extension, made of points that did not
+    exist before, and cleaning or smoothing renumbers and moves points; a boundary id that is a
+    position in some filter's extraction order means something different after each of those, and
+    used to have to be translated across every one of them. A label carried by the points does
+    not: vtkvmtkPolyDataFlowExtensionsFilter moves it to the tip of the extension it grows, and
+    vtkvmtkCapPolyData reads it to decide which cap is which.
+
+    A boundary no clip point opened gets a label above the last clip point index, so it can never
+    be mistaken for one that was cut.
+
+    :return: (labeled surface, set of clip point indices that were matched to no boundary). A clip
+      point is unmatched when it never cut, or when a later cut removed the boundary it opened.
+    """
+    if tolerance is None:
+        tolerance = self.planarityToleranceMm
+
+    planeOrigins = vtk.vtkPoints()
+    planeNormals = vtk.vtkDoubleArray()
+    planeNormals.SetNumberOfComponents(3)
+    planeLabels = vtk.vtkIdList()
+    for specification in planeSpecifications:
+        planeOrigins.InsertNextPoint(specification["origin"])
+        planeNormals.InsertNextTuple3(*specification["normal"])
+        # The label of a boundary is the index of the clip point that opened it, so that every
+        # per-boundary list below is indexed by clip point without a translation step.
+        planeLabels.InsertNextId(specification["index"])
+
+    labeler = vtkvmtkComputationalGeometry.vtkvmtkPolyDataBoundaryLabeler()
+    labeler.SetInputData(surface)
+    labeler.SetBoundaryLabelsArrayName(self.boundaryLabelsArrayName)
+    labeler.SetBoundaryPointOrderArrayName(self.boundaryPointOrderArrayName)
+    labeler.SetLabelingModeToOnPlane()
+    labeler.SetMaximumDistanceFromPlane(tolerance)
+    # MaximumDistanceFromPlaneOrigin is left unset: a single distance would have to be loose
+    # enough for the widest vessel end, which makes it no constraint at all on the narrow ones.
+    labeler.SetPlaneOrigins(planeOrigins)
+    labeler.SetPlaneNormals(planeNormals)
+    labeler.SetPlaneLabels(planeLabels)
+    labeler.Update()
+
+    unmatched = labeler.GetUnmatchedPlaneLabels()
+    unmatchedClipPointIndices = set(unmatched.GetId(index) for index in range(unmatched.GetNumberOfIds()))
+    return labeler.GetOutput(), unmatchedClipPointIndices
 
   def clipModel(self, surface, planeOrigin, planeNormal, localRadius=None, clippingMethod="PLANE_PATCH", sphereRadiusFactor=2.5):
     """Remove the end region of the vessel beyond a single plane. planeNormal should point
@@ -1847,36 +2882,44 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     polydata = splineFilter.GetOutput()
     return polydata
         
-  def extendVessel(self, surfacePolyData, centerlinesPolyData, extensionRatio, extensionMode,
-                   transitionRatio=None, interpolationMode=None, preserveCrossSectionShape=None,
+  def extendVessel(self, surfacePolyData, centerlinesPolyData, extensionRatio, extensionDirection,
+                   transitionRatio=None, transitionMethod=None, transitionToCircularCrossSection=None,
                    extensionLengthScaleFactors=None):
     """Adds flow extensions to all boundaries.
     :param extensionRatio: length of each extension, as a multiple of the mean radius of the
       boundary that it is attached to. Defaults to self.ExtensionRatio.
-    :param extensionMode: direction of the extension ("CENTERLINE_DIRECTION" or "BOUNDARY_NORMAL")
+    :param extensionDirection: direction of the extension ("CENTERLINE_DIRECTION" or "BOUNDARY_NORMAL")
     :param transitionRatio: length of the transition from the original cross-section to the target
       one, as a fraction of the extension length (0..1). Defaults to self.TransitionRatio.
-    :param interpolationMode: blending of the original cross-section into the target one
-      ("LINEAR", "RAMP" or "THIN_PLATE_SPLINE"). Defaults to self.InterpolationMode.
-    :param preserveCrossSectionShape: if enabled then the extension keeps the cross-sectional shape
-      of the boundary that it grows from, instead of morphing it into a circle.
-      Defaults to self.PreserveCrossSectionShape.
+    :param transitionMethod: blending of the original cross-section into the target one
+      ("LINEAR", "RAMP" or "THIN_PLATE_SPLINE"). Defaults to self.TransitionMethod.
+    :param transitionToCircularCrossSection: if enabled then the extension morphs the
+      cross-section of the boundary that it grows from into a circle; if not, it keeps the shape
+      that boundary has. Defaults to self.TransitionToCircularCrossSection.
     :param extensionLengthScaleFactors: optional per-boundary multipliers applied to the extension
-      length, indexed by boundary id (see computeBoundaryExtensionScaleFactors); None leaves all
-      extension lengths unscaled.
+      length, indexed by boundary id; None leaves all extension lengths unscaled. A boundary's id
+      is its label from the boundary labels this module writes (see labelClipBoundaries), which is
+      the index of the clip point that opened it.
+    :return: the extended surface. Growing an extension replaces the boundary it grew from with a
+      new one at the tip, but the filter carries the boundary's label across to it, so a vessel end
+      is still the same vessel end afterwards and nothing has to be renumbered.
     """
     if extensionRatio is None:
         extensionRatio = self.ExtensionRatio
     if transitionRatio is None:
         transitionRatio = self.TransitionRatio
-    if interpolationMode is None:
-        interpolationMode = self.InterpolationMode
-    if preserveCrossSectionShape is None:
-        preserveCrossSectionShape = self.PreserveCrossSectionShape
+    if transitionMethod is None:
+        transitionMethod = self.TransitionMethod
+    if transitionToCircularCrossSection is None:
+        transitionToCircularCrossSection = self.TransitionToCircularCrossSection
     transitionRatio = min(max(float(transitionRatio), 0.0), 1.0)
     
     extensionsFilter = vtkvmtkComputationalGeometry.vtkvmtkPolyDataFlowExtensionsFilter()
     extensionsFilter.SetInputData(surfacePolyData)
+    # Read the boundaries from the labels, and carry each one across to the tip of its own
+    # extension, so that a vessel end keeps its identity through the rebuild.
+    extensionsFilter.SetBoundaryLabelsArrayName(self.boundaryLabelsArrayName)
+    extensionsFilter.SetBoundaryPointOrderArrayName(self.boundaryPointOrderArrayName)
     extensionsFilter.SetCenterlines(centerlinesPolyData)
     extensionsFilter.SetAdaptiveExtensionLength(self.AdaptiveExtensionLength)
     extensionsFilter.SetAdaptiveExtensionRadius(self.AdaptiveExtensionRadius)
@@ -1892,52 +2935,32 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     extensionsFilter.SetTransitionRatio(transitionRatio)
     extensionsFilter.SetCenterlineNormalEstimationDistanceRatio(self.CenterlineNormalEstimationDistanceRatio)
     extensionsFilter.SetNumberOfBoundaryPoints(self.TargetNumberOfBoundaryPoints)
-    extensionsFilter.SetPreserveCrossSectionShape(1 if preserveCrossSectionShape else 0)
-    if extensionMode == "CENTERLINE_DIRECTION":
+    # The filter's flag is the opposite of this module's: it asks whether to keep the shape.
+    extensionsFilter.SetPreserveCrossSectionShape(0 if transitionToCircularCrossSection else 1)
+    if extensionDirection == "CENTERLINE_DIRECTION":
         extensionsFilter.SetExtensionModeToUseCenterlineDirection()
-    elif extensionMode == "BOUNDARY_NORMAL":
+    elif extensionDirection == "BOUNDARY_NORMAL":
         extensionsFilter.SetExtensionModeToUseNormalToBoundary()
-    if interpolationMode == "LINEAR":
+    if transitionMethod == "LINEAR":
         extensionsFilter.SetInterpolationModeToLinear()
-    elif interpolationMode == "THIN_PLATE_SPLINE":
+    elif transitionMethod == "THIN_PLATE_SPLINE":
         extensionsFilter.SetInterpolationModeToThinPlateSpline()
-    elif interpolationMode == "RAMP":
+    elif transitionMethod == "RAMP":
         extensionsFilter.SetInterpolationModeToRamp()
     extensionsFilter.Update()
     return extensionsFilter.GetOutput()
 
-  def computeBoundaryExtensionScaleFactors(self, surface, clipPointPositions, clipPointScaleFactors):
-    """Per-boundary extension length scale factors for the flow extensions filter.
-    Each open boundary of surface gets the scale factor of the clip point closest to the
-    boundary's barycenter. The boundaries are enumerated with the same boundary extractor that
-    vtkvmtkPolyDataFlowExtensionsFilter uses internally, so the indices of the returned list
-    match the boundary ids the filter assigns when surface is its input.
-    :param clipPointPositions: one position per clip point
-    :param clipPointScaleFactors: the corresponding scale factor of each clip point
-    :return: list with one scale factor per open boundary of surface, or None when there are
-      no clip points to map the boundaries to.
-    """
-    if not clipPointPositions:
-        return None
-    boundaryExtractor = vtkvmtkComputationalGeometry.vtkvmtkPolyDataBoundaryExtractor()
-    boundaryExtractor.SetInputData(surface)
-    boundaryExtractor.Update()
-    boundaries = boundaryExtractor.GetOutput()
-    boundaryScaleFactors = []
-    for boundaryIndex in range(boundaries.GetNumberOfCells()):
-        boundaryPoints = boundaries.GetCell(boundaryIndex).GetPoints()
-        barycenter = np.mean([boundaryPoints.GetPoint(pointIndex)
-                              for pointIndex in range(boundaryPoints.GetNumberOfPoints())], axis=0)
-        closestClipPointIndex = min(range(len(clipPointPositions)),
-            key=lambda index: vtk.vtkMath.Distance2BetweenPoints(barycenter, clipPointPositions[index]))
-        boundaryScaleFactors.append(float(clipPointScaleFactors[closestClipPointIndex]))
-    return boundaryScaleFactors
-
   def clipVessel(self, surfacePolyData, centerlinesNode, clipPointsMarkupsNode, cap, addFlowExtensions,
-                 extensionRatio, extensionMode, manualClipPlaneNormals=None, manualClipPlaneOrigins=None,
+                 extensionRatio, extensionDirection, manualClipPlaneNormals=None, manualClipPlaneOrigins=None,
                  interactivePointIndex=-1, clippingMethod="PLANE_PATCH", sphereRadiusFactor=2.5,
-                 transitionRatio=None, interpolationMode=None, preserveCrossSectionShape=None,
-                 extensionScaleFactors=None):
+                 transitionRatio=None, transitionMethod=None, transitionToCircularCrossSection=None,
+                 extensionScaleFactors=None,
+                 labelModelFaces=False, modelFaceIdArrayName=_DEFAULT_MODEL_FACE_ID_ARRAY_NAME,
+                 capMethod=_DEFAULT_CAP_METHOD,
+                 capConstraintFactor=_DEFAULT_CAP_CONSTRAINT_FACTOR,
+                 capNumberOfRings=_DEFAULT_CAP_NUMBER_OF_RINGS,
+                 remeshCaps=False,
+                 capTargetEdgeLength=_DEFAULT_CAP_TARGET_EDGE_LENGTH):
     """Clips the vessel.
     :param surfacePolyData: input surface
     :param centerlinesPolyData: input centerlines
@@ -1946,18 +2969,40 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     :param addFlowExtensions: flag indicating whether to add flow extensions:
     :param extensionRatio: length of each flow extension, as a multiple of the radius of the
       vessel end that it is attached to; None uses the logic default
-    :param extensionMode: string specifying the extension mode:
+    :param extensionDirection: string specifying the direction of the flow extensions
+      ("CENTERLINE_DIRECTION" or "BOUNDARY_NORMAL"); None uses the logic default
     :param transitionRatio: length of the flow extension transition (original cross-section to
       the target one) as a fraction of the extension length; None uses the logic default
-    :param interpolationMode: string specifying how the original cross-section is blended into
+    :param transitionMethod: string specifying how the original cross-section is blended into
       the target one ("LINEAR", "RAMP" or "THIN_PLATE_SPLINE"); None uses the logic default
-    :param preserveCrossSectionShape: if enabled then the flow extensions keep the cross-sectional
-      shape of the vessel ends instead of morphing it into a circle; None uses the logic default
+    :param transitionToCircularCrossSection: if enabled then the flow extensions morph the
+      cross-section of the vessel ends into a circle, rather than keeping the shape they have;
+      None uses the logic default
     :param extensionScaleFactors: optional dict mapping clip point IDs (control point IDs of
       clipPointsMarkupsNode) to a multiplier applied to the length of the flow extension grown
       from that vessel end; ends without an entry keep the unscaled length
+    :param labelModelFaces: if enabled then every output cell is tagged with an integer face id
+      (wall vs. one id per cap) in the modelFaceIdArrayName cell array; see labelModelFaces()
+    :param modelFaceIdArrayName: name of the cell array that holds the face ids
+    :param capMethod: shape of the cap mesh, "CENTERPOINT", "SIMPLE" or "SMOOTH"; see capSurface()
+    :param capConstraintFactor: how far a "SMOOTH" cap bulges out of the plane of the cut, 0 for
+      a cap that stays in it
+    :param capNumberOfRings: number of rings of cells a "SMOOTH" cap is made of
+    :param remeshCaps: if enabled then the caps are retriangulated to a uniform point
+      distribution, leaving the vessel wall untouched; see remeshCaps()
+    :param capTargetEdgeLength: edge length a remeshed cap aims for, in mm; 0 sizes each cap
+      after the surface around its own rim
     :return: polydata containing clipped vessel
     """
+
+    # Say which input is missing. Without this the first thing to touch one of them raises an
+    # AttributeError on None, which names neither the input nor the module that wanted it.
+    if not centerlinesNode:
+        raise ValueError(_("Valid input centerlines are required"))
+    if centerlinesNode.GetPolyData() is None:
+        raise ValueError(_("The input centerlines node holds no mesh"))
+    if not clipPointsMarkupsNode:
+        raise ValueError(_("Valid clip points are required"))
 
     centerlinesPolyData = self.getCachedCenterlineGeometry(centerlinesNode)
 
@@ -2058,30 +3103,136 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         addFlowExtensions = False
         cap = False
 
+    # Which cut opened which boundary, settled once here, while the boundaries still lie exactly
+    # where the cuts left them, and written into the surface's own point data. From here on a
+    # vessel end is referred to by its label, which is the index of the clip point that opened it,
+    # and which the filters that rebuild the mesh carry with the points rather than renumber.
+    surface, unmatchedClipPointIndices = self.labelClipBoundaries(surface, planeSpecifications)
+    unidentifiedLabels = [specification["label"] for specification in planeSpecifications
+                          if specification["index"] in unmatchedClipPointIndices]
+    if unidentifiedLabels:
+        # Without a boundary to point at, that vessel end gets neither its own face id nor its own
+        # extension length; say so rather than let it quietly fall back to the capper's numbering.
+        logging.warning("Clip Vessel could not tell which boundary belongs to %d clip point(s) (%s); "
+                        "their caps take an id of the capping filter's own choosing and their flow "
+                        "extensions are left unscaled.",
+                        len(unidentifiedLabels), ", ".join(unidentifiedLabels))
+
     if addFlowExtensions:
         slicer.util.showStatusMessage(_("Adding extensions..."))
         slicer.app.processEvents()
+        if labelModelFaces and surface.GetCellData().GetArray(modelFaceIdArrayName or "") is not None:
+            # The extensions filter builds its cells from scratch and carries no cell data.
+            logging.warning("Clip Vessel discarded the face labels the input surface carried: adding "
+                            "flow extensions rebuilds the mesh and does not preserve cell data.")
         boundaryScaleFactors = None
         if extensionScaleFactors and any(abs(scaleFactor - 1.0) > 1e-6 for scaleFactor in extensionScaleFactors.values()):
-            # The clip plane origins (with any manual overrides applied) are used as the clip
-            # point positions, so each open boundary is matched to the cut that created it.
-            clipPointScaleFactors = [
-                extensionScaleFactors.get(clipPointsMarkupsNode.GetNthControlPointID(specification["index"]), 1.0)
-                for specification in planeSpecifications]
-            boundaryScaleFactors = self.computeBoundaryExtensionScaleFactors(
-                surface, [specification["origin"] for specification in planeSpecifications], clipPointScaleFactors)
-        surface = self.extendVessel(surface, centerlinesPolyData, extensionRatio, extensionMode,
-                                    transitionRatio, interpolationMode, preserveCrossSectionShape,
-                                    boundaryScaleFactors)
+            # One factor per boundary id, and a boundary id is a clip point index, so entry i
+            # belongs to clip point i. A boundary no cut opened - a hole the input already had -
+            # carries a label above the last clip point index, falls off the end of the list, and
+            # is left unscaled rather than inheriting the factor of whichever clip point happens
+            # to be nearest.
+            # Written at the boundary id rather than appended, so that the list is indexed the
+            # way the filter reads it however planeSpecifications happens to be ordered.
+            boundaryScaleFactors = [1.0] * (max(specification["index"]
+                                                for specification in planeSpecifications) + 1)
+            for specification in planeSpecifications:
+                clipPointId = clipPointsMarkupsNode.GetNthControlPointID(specification["index"])
+                boundaryScaleFactors[specification["index"]] = extensionScaleFactors.get(clipPointId, 1.0)
+        surface = self.extendVessel(
+            surface, centerlinesPolyData, extensionRatio, extensionDirection,
+            transitionRatio, transitionMethod, transitionToCircularCrossSection,
+            boundaryScaleFactors)
+
+    if cap and capMethod in _CAP_METHODS_NEEDING_TRIANGLES:
+        # Ahead of the face ids being read, so that they still line up cell for cell with the
+        # surface that gets capped (vtkTriangleFilter carries cell data over to every triangle
+        # it splits a cell into).
+        surface = self.triangulateSurface(surface)
+
+    faceIdArrayName = (modelFaceIdArrayName or "").strip() if labelModelFaces else ""
+    if labelModelFaces and not faceIdArrayName:
+        logging.warning("Clip Vessel skipped labeling the faces: no face id array name was given.")
+
+    # Read the labels while the cells still line up with the ones about to be capped: the
+    # capping filter carries no other cell data through.
+    existingFaceIds = None
+    if faceIdArrayName:
+        existingArray = surface.GetCellData().GetArray(faceIdArrayName)
+        if existingArray is not None and existingArray.GetNumberOfTuples() == surface.GetNumberOfCells():
+            existingFaceIds = vtk_to_numpy(existingArray).astype(np.int64).copy()
+            if cap:
+                # A vtkPolyData indexes cells verts, lines, polys, strips and the capping filter
+                # copies only the polys, so take the poly cells' labels alone. One vert or line
+                # cell - vtkCleanPolyData makes them from degenerate triangles - would otherwise
+                # shift every label a cell out of step and scatter them over the surface.
+                firstPolyCell = surface.GetNumberOfVerts() + surface.GetNumberOfLines()
+                existingFaceIds = existingFaceIds[firstPolyCell:firstPolyCell + surface.GetNumberOfPolys()]
+
+    # A cap takes the label of the boundary it closes, and every boundary has one: the clip point
+    # index for a boundary a cut opened, and a fresh label above those for a hole no cut accounts
+    # for. So the value the capper leaves on the cells it copied is the one thing that must not
+    # be a label, and no label is negative.
+    wallCellEntityId = -1
 
     # Cap all the holes that are in the surface
     if cap:
         slicer.util.showStatusMessage(_("Capping surface..."))
         slicer.app.processEvents() 
-        surface = self.capSurface(surface)
+        # A private array, not the user's: on an input already carrying the user's array the
+        # filter numbers the new caps on top of the existing ids (see capSurface). Remeshing the
+        # caps needs it too, to tell a cap cell from a wall cell, even with no labeling asked for.
+        surface = self.capSurface(surface,
+                                  self.capBoundaryIdsArrayName if (faceIdArrayName or remeshCaps) else None,
+                                  wallCellEntityId,
+                                  capMethod=capMethod, constraintFactor=capConstraintFactor,
+                                  numberOfRings=capNumberOfRings)
+
+    # After capping and extensions: extensions drop cell data, and the caps only exist once the
+    # capper has made them.
+    self.lastFaceIdAssignments = []
+    if faceIdArrayName:
+        slicer.util.showStatusMessage(_("Labeling faces..."))
+        slicer.app.processEvents()
+        self.lastFaceIdAssignments = self.labelModelFaces(surface, planeSpecifications, faceIdArrayName,
+                                                          existingFaceIds, wallCellEntityId)
+
+    # Last of all: the remesher rebuilds the mesh and keeps only the one cell array it is given,
+    # so anything that matches cells of the output up with cells of the input - the face labels
+    # above do - has to have had its say by now.
+    if cap and remeshCaps:
+        slicer.util.showStatusMessage(_("Remeshing caps..."))
+        slicer.app.processEvents()
+        if faceIdArrayName:
+            # The face ids are what the caps are told apart by, so the remesher carries the right
+            # one onto every triangle it makes and the caps come out labeled without a second pass.
+            capEntityIds = [faceId for faceId, _label in self.lastFaceIdAssignments]
+            surface = self.remeshCaps(surface, faceIdArrayName, capEntityIds, capTargetEdgeLength)
+            # The remesher rebuilds the cell data, which leaves nothing marked active.
+            surface.GetCellData().SetActiveScalars(faceIdArrayName)
+        else:
+            # Nothing labeled the faces, so the capper's own per-boundary ids say which cells are
+            # caps. They carry wallCellEntityId on the wall, which is negative and would read to
+            # the remesher as "no entity", so they are shifted onto 0 for the wall and 1 up for
+            # the caps (see remeshCaps).
+            capBoundaryArray = surface.GetCellData().GetArray(self.capBoundaryIdsArrayName)
+            if capBoundaryArray is not None:
+                entityIds = vtk_to_numpy(capBoundaryArray).astype(np.int64) - wallCellEntityId
+                entityIdsArray = numpy_to_vtk(entityIds.astype(np.int32), deep=True, array_type=vtk.VTK_INT)
+                entityIdsArray.SetName(self.capBoundaryIdsArrayName)
+                surface.GetCellData().RemoveArray(self.capBoundaryIdsArrayName)
+                surface.GetCellData().AddArray(entityIdsArray)
+                surface = self.remeshCaps(surface, self.capBoundaryIdsArrayName,
+                                          [value for value in np.unique(entityIds) if value > 0],
+                                          capTargetEdgeLength)
+            surface.GetCellData().RemoveArray(self.capBoundaryIdsArrayName)   # internal bookkeeping
 
     surfacePolyData = vtk.vtkPolyData()
     surfacePolyData.DeepCopy(surface)
+    if faceIdArrayName:
+        # What labelModelFaces() labeled stays behind here; the copy is what the caller shows, so
+        # it is the copy the run describes.
+        self.rememberRunStateSurface(surfacePolyData)
 
     logging.debug("End of Clip Vessel Computation..")
     return surfacePolyData
@@ -2169,14 +3320,14 @@ class ClipVesselTest(ScriptedLoadableModuleTest):
     cap = True
     addFlowExtensions = False
     extensionRatio = 2.0
-    extensionMode = "BOUNDARY_NORMAL"
+    extensionDirection = "BOUNDARY_NORMAL"
     transitionRatio = 0.5
 
     # Clip with all clipping methods, each into its own output model node
     for clippingMethod in ["PLANE", "PLANE_SPHERE", "PLANE_PATCH", "BOX"]:
         self.delayDisplay("Clipping vessel (%s)" % clippingMethod)
         outputPolyData = clipVesselLogic.clipVessel(preprocessedPolyData, centerlineModelNode, clipPointsMarkupsNode,
-                                                    cap, addFlowExtensions, extensionRatio, extensionMode,
+                                                    cap, addFlowExtensions, extensionRatio, extensionDirection,
                                                     clippingMethod=clippingMethod)
         self.assertIsNotNone(outputPolyData)
         self.assertGreater(outputPolyData.GetNumberOfCells(), 0)
@@ -2200,17 +3351,101 @@ class ClipVesselTest(ScriptedLoadableModuleTest):
             "Clipped vessel (%s)" % clippingMethod)
         outputModelNode.SetAndObserveMesh(outputPolyData)
 
-    # Clip again with flow extensions added to the open vessel ends, once per interpolation mode,
+    # Clip once per capping method. Each must close the surface with outward facing triangles.
+    # A cap of zero roundness is flat, whichever method made it; only a smooth cap given enough
+    # roundness domes out of the cut plane far enough to reach past the vessel itself.
+    numberOfClipPointsForCaps = clipPointsMarkupsNode.GetNumberOfControlPoints()
+    capMethodDiagonals = {}
+    for capMethod, capRoundness in [("CENTERPOINT", 0.0), ("SIMPLE", 0.0), ("SMOOTH", 0.0), ("SMOOTH", 2.0)]:
+        description = capMethod if capMethod != "SMOOTH" else "%s, roundness %g" % (capMethod, capRoundness)
+        self.delayDisplay("Capping clipped vessel (%s)" % description)
+        cappedPolyData = clipVesselLogic.clipVessel(preprocessedPolyData, centerlineModelNode, clipPointsMarkupsNode,
+                                                    cap, addFlowExtensions, extensionRatio, extensionDirection,
+                                                    clippingMethod="PLANE_PATCH", labelModelFaces=True,
+                                                    capMethod=capMethod, capConstraintFactor=capRoundness)
+        self.assertIsNotNone(cappedPolyData)
+        self.assertEqual(clipVesselLogic.lastUnclippedPoints, [])
+        self.assertEqual(clipVesselLogic.lastPlanarityFailures, [])
+        # Every cell must be a triangle, whichever capper made it
+        self.assertEqual(cappedPolyData.GetPolys().IsHomogeneous(), 3)
+        self.assertEqual(cappedPolyData.GetNumberOfCells(), cappedPolyData.GetNumberOfPolys())
+        # The caps must face the same way as the vessel wall: re-orienting the output must find
+        # nothing to re-wind. Two of the three cappers wind their caps inwards on their own, so
+        # without the fix in capSurface the caps would render as though lit from inside.
+        orientedCaps = vtk.vtkPolyDataNormals()
+        orientedCaps.SetInputData(cappedPolyData)
+        orientedCaps.ComputePointNormalsOff()
+        orientedCaps.ComputeCellNormalsOn()
+        orientedCaps.ConsistencyOn()
+        orientedCaps.AutoOrientNormalsOn()
+        orientedCaps.SplittingOff()
+        orientedCaps.Update()
+        self.assertTrue(np.array_equal(
+            vtk_to_numpy(cappedPolyData.GetPolys().GetConnectivityArray()),
+            vtk_to_numpy(orientedCaps.GetOutput().GetPolys().GetConnectivityArray())))
+        # No normals may survive capping either: the simple capper hands its cap vertices the
+        # normals the vessel wall left on them, which shades the cap as though it were wall.
+        for attributes in [cappedPolyData.GetPointData(), cappedPolyData.GetCellData()]:
+            self.assertIsNone(attributes.GetNormals())
+            self.assertIsNone(attributes.GetArray("Normals"))
+        # The caps must close the surface
+        boundaryEdges = vtk.vtkFeatureEdges()
+        boundaryEdges.SetInputData(cappedPolyData)
+        boundaryEdges.BoundaryEdgesOn()
+        boundaryEdges.FeatureEdgesOff()
+        boundaryEdges.NonManifoldEdgesOff()
+        boundaryEdges.ManifoldEdgesOff()
+        boundaryEdges.Update()
+        self.assertEqual(boundaryEdges.GetOutput().GetNumberOfCells(), 0)
+        # ...and each of them must be labeled as its own face, as with the default capper
+        capFaceIds = vtk_to_numpy(cappedPolyData.GetCellData().GetArray("ModelFaceID"))
+        self.assertEqual(set(int(value) for value in np.unique(capFaceIds)),
+                         set(range(1, numberOfClipPointsForCaps + 2)))
+        if capRoundness == 0.0:
+            # A cap of zero roundness is flat: every point of it lies in one plane, the plane of
+            # the cut it closes. Measured as the spread of the cap's points along the normal of
+            # their own best fit plane, against the width of the cap itself, so that it says
+            # "flat" rather than "small".
+            cappedPoints = vtk_to_numpy(cappedPolyData.GetPoints().GetData())
+            for capFaceId in range(2, numberOfClipPointsForCaps + 2):
+                capPointIds = set()
+                for cellId in np.nonzero(capFaceIds == capFaceId)[0]:
+                    cell = cappedPolyData.GetCell(int(cellId))
+                    for pointIndex in range(cell.GetNumberOfPoints()):
+                        capPointIds.add(cell.GetPointId(pointIndex))
+                self.assertGreater(len(capPointIds), 3, "cap %d has no cells" % capFaceId)
+                capPoints = cappedPoints[sorted(capPointIds)]
+                centered = capPoints - capPoints.mean(axis=0)
+                singularValues, rightVectors = np.linalg.svd(centered)[1:]
+                outOfPlane = np.abs(centered @ rightVectors[-1]).max()
+                capWidth = singularValues[0]
+                self.assertLess(outOfPlane, 0.01 * capWidth,
+                                "%s cap %d is %g out of plane across a width of %g"
+                                % (description, capFaceId, outOfPlane, capWidth))
+        capMethodDiagonals[description] = vtk.vtkBoundingBox(cappedPolyData.GetBounds()).GetDiagonalLength()
+        cappedModelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode",
+            "Clipped vessel (cap: %s)" % description)
+        cappedModelNode.SetAndObserveMesh(cappedPolyData)
+    # A flat cap adds nothing to the extent of the surface, whichever method made it, so all
+    # three agree with the centre point capper. Roundness is what changes that, and it has to be
+    # enough of it: a modest dome is still inside the bounding box of the vessel, which is set by
+    # the vessel rather than by its ends, so the box only grows once the cap reaches past it.
+    self.assertAlmostEqual(capMethodDiagonals["SIMPLE"], capMethodDiagonals["CENTERPOINT"], delta=0.01)
+    self.assertAlmostEqual(capMethodDiagonals["SMOOTH, roundness 0"], capMethodDiagonals["CENTERPOINT"], delta=0.01)
+    self.assertGreater(capMethodDiagonals["SMOOTH, roundness 2"], capMethodDiagonals["CENTERPOINT"])
+
+    # Clip again with flow extensions added to the open vessel ends, once per transition method,
     # and once more with the cross-section shape of the vessel ends preserved
-    extensionOptions = [("LINEAR", False), ("THIN_PLATE_SPLINE", False), ("RAMP", False), ("RAMP", True)]
-    for interpolationMode, preserveCrossSectionShape in extensionOptions:
-        description = "%s%s" % (interpolationMode, ", preserved cross-section" if preserveCrossSectionShape else "")
+    extensionOptions = [("LINEAR", True), ("THIN_PLATE_SPLINE", True), ("RAMP", True), ("RAMP", False)]
+    for transitionMethod, transitionToCircularCrossSection in extensionOptions:
+        description = "%s%s" % (transitionMethod,
+                                "" if transitionToCircularCrossSection else ", preserved cross-section")
         self.delayDisplay("Clipping vessel with flow extensions (%s)" % description)
         extendedPolyData = clipVesselLogic.clipVessel(preprocessedPolyData, centerlineModelNode, clipPointsMarkupsNode,
-                                                      cap, True, extensionRatio, extensionMode,
+                                                      cap, True, extensionRatio, extensionDirection,
                                                       transitionRatio=transitionRatio,
-                                                      interpolationMode=interpolationMode,
-                                                      preserveCrossSectionShape=preserveCrossSectionShape)
+                                                      transitionMethod=transitionMethod,
+                                                      transitionToCircularCrossSection=transitionToCircularCrossSection)
         self.assertIsNotNone(extendedPolyData)
         self.assertGreater(extendedPolyData.GetNumberOfCells(), 0)
         self.assertEqual(clipVesselLogic.lastUnclippedPoints, [])
@@ -2231,13 +3466,13 @@ class ClipVesselTest(ScriptedLoadableModuleTest):
     # localized methods can leave slivers of the original vessel end (outside their local
     # sphere) beyond the clip plane, which would corrupt the extension length measurement.
     unscaledPolyData = clipVesselLogic.clipVessel(preprocessedPolyData, centerlineModelNode, clipPointsMarkupsNode,
-                                                  False, True, extensionRatio, extensionMode,
+                                                  False, True, extensionRatio, extensionDirection,
                                                   clippingMethod="PLANE",
-                                                  transitionRatio=transitionRatio, interpolationMode="RAMP")
+                                                  transitionRatio=transitionRatio, transitionMethod="RAMP")
     scaledPolyData = clipVesselLogic.clipVessel(preprocessedPolyData, centerlineModelNode, clipPointsMarkupsNode,
-                                                False, True, extensionRatio, extensionMode,
+                                                False, True, extensionRatio, extensionDirection,
                                                 clippingMethod="PLANE",
-                                                transitionRatio=transitionRatio, interpolationMode="RAMP",
+                                                transitionRatio=transitionRatio, transitionMethod="RAMP",
                                                 extensionScaleFactors={inletPointId: inletScaleFactor})
     self.assertEqual(clipVesselLogic.lastUnclippedPoints, [])
 
@@ -2270,6 +3505,74 @@ class ClipVesselTest(ScriptedLoadableModuleTest):
     unscaledModelNode.SetAndObserveMesh(unscaledPolyData)
     scaledModelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", "Clipped vessel (inlet extension scaled)")
     scaledModelNode.SetAndObserveMesh(scaledPolyData)
+    # Face labeling: wall id 1, then one cap per clip point in clip point order. Run it with and
+    # without flow extensions, since extensions move each cap several radii from the clip plane
+    # it grew from, which is the case the cap-to-clip-point matching has to cope with.
+    numberOfClipPoints = clipPointsMarkupsNode.GetNumberOfControlPoints()
+    clipPlanes = [clipVesselLogic.automaticClipPlane(centerlineModelNode, clipPointsMarkupsNode, index)
+                  for index in range(numberOfClipPoints)]
+    for addExtensions in [False, True]:
+        self.delayDisplay("Labeling model faces (%s flow extensions)" % ("with" if addExtensions else "without"))
+        labeledPolyData = clipVesselLogic.clipVessel(preprocessedPolyData, centerlineModelNode, clipPointsMarkupsNode,
+                                                     cap, addExtensions, extensionRatio, extensionDirection,
+                                                     transitionRatio=transitionRatio, labelModelFaces=True)
+        faceIdArray = labeledPolyData.GetCellData().GetArray("ModelFaceID")
+        self.assertIsNotNone(faceIdArray)
+        self.assertTrue(faceIdArray.IsA("vtkIntArray"))
+        self.assertEqual(faceIdArray.GetNumberOfTuples(), labeledPolyData.GetNumberOfCells())
+        faceIds = vtk_to_numpy(faceIdArray)
+        self.assertEqual(clipVesselLogic.lastWallFaceId, 1)
+        self.assertEqual(clipVesselLogic.lastExistingFaceIdMap, {})
+        self.assertEqual(set(int(value) for value in np.unique(faceIds)), set(range(1, numberOfClipPoints + 2)))
+        self.assertGreater(np.count_nonzero(faceIds == 1), np.count_nonzero(faceIds != 1))
+        self.assertEqual(len(clipVesselLogic.lastFaceIdAssignments), numberOfClipPoints)
+        cellCenters = vtk.vtkCellCenters()
+        cellCenters.SetInputData(labeledPolyData)
+        cellCenters.Update()
+        centers = vtk_to_numpy(cellCenters.GetOutput().GetPoints().GetData())
+        for faceId, pointLabel in clipVesselLogic.lastFaceIdAssignments:
+            index = faceId - 2
+            self.assertEqual(pointLabel, clipPointsMarkupsNode.GetNthControlPointLabel(index))
+            # Each cap must sit on its own clip plane's axis, and beyond the plane once an
+            # extension has pushed it down the removed branch.
+            origin, normal, radius = clipPlanes[index]
+            offset = centers[faceIds == faceId].mean(axis=0) - np.array(origin)
+            alongNormal = float(np.dot(offset, normal))
+            self.assertLess(float(np.linalg.norm(offset - alongNormal * np.array(normal))), radius)
+            if addExtensions:
+                self.assertGreater(alongNormal, 0.0)
+
+    # Uncapped: no caps to tell apart, so the whole surface is wall.
+    self.delayDisplay("Labeling model faces (uncapped)")
+    uncappedPolyData = clipVesselLogic.clipVessel(preprocessedPolyData, centerlineModelNode, clipPointsMarkupsNode,
+                                                  False, False, extensionRatio, extensionDirection, labelModelFaces=True)
+    self.assertEqual(set(int(value) for value in np.unique(
+        vtk_to_numpy(uncappedPolyData.GetCellData().GetArray("ModelFaceID")))), {1})
+    self.assertEqual(clipVesselLogic.lastFaceIdAssignments, [])
+
+    # An input that already carries labels: face 10 compacts to 1, the wall takes 2 and the caps
+    # follow, and no cap is fused into the pre-existing face (which can only shrink as it is
+    # clipped, never grow).
+    self.delayDisplay("Labeling model faces (input already labeled)")
+    prelabeledInput = vtk.vtkPolyData()
+    prelabeledInput.DeepCopy(preprocessedPolyData)
+    patchCellCount = prelabeledInput.GetNumberOfCells() // 10
+    prelabeledValues = np.zeros(prelabeledInput.GetNumberOfCells(), dtype=np.int32)
+    prelabeledValues[:patchCellCount] = 10
+    prelabeledArray = numpy_to_vtk(prelabeledValues, deep=True, array_type=vtk.VTK_INT)
+    prelabeledArray.SetName("ModelFaceID")
+    prelabeledInput.GetCellData().AddArray(prelabeledArray)
+    prelabeledPolyData = clipVesselLogic.clipVessel(prelabeledInput, centerlineModelNode, clipPointsMarkupsNode,
+                                                    cap, False, extensionRatio, extensionDirection, labelModelFaces=True)
+    prelabeledFaceIds = vtk_to_numpy(prelabeledPolyData.GetCellData().GetArray("ModelFaceID"))
+    self.assertEqual(clipVesselLogic.lastExistingFaceIdMap, {10: 1})
+    self.assertEqual(clipVesselLogic.lastWallFaceId, 2)
+    self.assertEqual(set(int(value) for value in np.unique(prelabeledFaceIds)),
+                     set(range(1, numberOfClipPoints + 3)))
+    self.assertGreater(np.count_nonzero(prelabeledFaceIds == 1), 0)
+    self.assertLessEqual(np.count_nonzero(prelabeledFaceIds == 1), patchCellCount)
+    # The internal cap bookkeeping array must not leak into the output
+    self.assertIsNone(prelabeledPolyData.GetCellData().GetArray(clipVesselLogic.capBoundaryIdsArrayName))
 
     # Show all models as surface with edges
     for modelNode in slicer.util.getNodesByClass("vtkMRMLModelNode"):
