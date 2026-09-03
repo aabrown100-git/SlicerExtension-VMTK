@@ -25,7 +25,8 @@ The 'junction angles' component measures the angles between the branches that me
 
       - a table with one row for every pair of branches of every bifurcation,
       - a curve for each measured branch direction, in a 'vectors' folder,
-      - an angle markup for each pair of branches, in an 'annotations' folder, grouped by the type of the pair.
+      - an angle markup for each pair of branches, in an 'annotations' folder, grouped by the type of the pair,
+      - a drawing of the centerline and its angles, shown in the slice views.
 
 ![Junction angles](CenterlineDisassembly_JunctionAngles.png)
 
@@ -49,5 +50,17 @@ A branch is identified by its `GroupId`, which is also stored as a node attribut
 | `Branch1OutOfPlaneAngleDegrees`, `Branch2OutOfPlaneAngleDegrees` | Angle between each branch and the bifurcation plane |
 
 All the pairs of branches of the table are annotated, which means that several angles are labelled at the same position at a bifurcation. The annotations are therefore grouped in a 'Child-child angles' and a 'Parent-child angles' folder, so that either group can be shown or hidden at once with the eye icon of the Data module. Child-child angles are yellow, parent-child angles are cyan.
+
+An annotation is labelled with the angle value only, which is also its node name; the pair of branches it belongs to is told by its folder, its color, and its `Branch1GroupId` and `Branch2GroupId` attributes. Its rays are drawn several times longer than the measured segments so that they are readable next to the vessel: the angle depends on the directions of the rays only, and the bifurcation vector curves show over what distance each direction was measured.
+
+The drawing shows the centerline to scale, projected onto the plane along which it spreads the most and turned so that the inlet is at the bottom, so it follows the anatomy; a tree that is strongly three dimensional is partly seen edge on whatever the plane. The centerline is a thin gray line, and every angle is drawn the way its annotation is drawn in 3D: a ray along each of the two branches, an arc between them, and the value, in the color of that kind of pair. Several angles of one bifurcation get arcs of growing radius so that they do not fall onto each other. The drawing is loaded as a volume, so it is stored with the scene.
+
+Selecting a model or a segment as the optional `Vessel surface` gives the drawing a translucent gray silhouette of the vessel, the way a 3D view of a transparent surface shows it, which puts the angles in the context of the anatomy. Every triangle of the surface is drawn, so a vessel that folds over itself in the plane of the drawing looks darker there; a dense surface is simplified first.
+
+The 'Junction angle diagram' section holds the vessel surface and tells what the drawing shows: 'Child-child angles' and 'Parent-child angles' select which angles are drawn, and 'Label bifurcations' and 'Label branches' whether the groups are named. The section is only shown while 'Junction angles' is selected as a component. Only the drawing is affected; the table always holds every pair.
+
+Note that the arc of an angle spans the angle as projected onto the plane of the drawing, while the value next to it is the angle that was measured in three dimensions. The two differ where a bifurcation is far from that plane.
+
+A pair of branches whose angle could not be measured, because a branch has no usable direction, is reported in the table only: it has no annotation and no drawn direction.
 
 The generated curves and angle markups are locked, since they are measurement results. Every run creates its own nodes and folders, as the other components of this module do.

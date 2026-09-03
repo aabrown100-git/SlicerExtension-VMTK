@@ -106,6 +106,10 @@ class CenterlineDisassemblyWidget(ScriptedLoadableModuleWidget, VTKObservationMi
 
         # Update the parameter node.
         self.ui.inputCenterlineSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onCenterlineChanged)
+        self.ui.inputSurfaceSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onSurfaceChanged)
+        self.ui.inputSegmentSelectorWidget.connect("currentSegmentChanged(QString)", self.onSegmentChanged)
+        for checkBox, role in self._diagramOptionCheckBoxes():
+            checkBox.connect("toggled(bool)", lambda checked, role=role: self.onDiagramOptionToggled(role, checked))
         self.ui.parameterSetSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.setParameterNode)
         self.ui.optionCreateModelsToolButton.connect("toggled(bool)", self.onCreateModels)
         self.ui.optionCreateCurvesMenuButton.connect("toggled(bool)", self.onCreateCurves)
@@ -195,6 +199,11 @@ class CenterlineDisassemblyWidget(ScriptedLoadableModuleWidget, VTKObservationMi
             self._parameterNode.SetParameter(ROLE_CREATE_CENTERLINES, str(0))
         if (not self._parameterNode.HasParameter(ROLE_CREATE_JUNCTION_ANGLES)):
             self._parameterNode.SetParameter(ROLE_CREATE_JUNCTION_ANGLES, str(0))
+        if (not self._parameterNode.HasParameter(ROLE_INPUT_SEGMENT_ID)):
+            self._parameterNode.SetParameter(ROLE_INPUT_SEGMENT_ID, "")
+        for checkBox, role in self._diagramOptionCheckBoxes():
+            if (not self._parameterNode.HasParameter(role)):
+                self._parameterNode.SetParameter(role, str(1))
 
     def onApplyButton(self) -> None:
         """
@@ -224,7 +233,7 @@ class CenterlineDisassemblyWidget(ScriptedLoadableModuleWidget, VTKObservationMi
             
             self.showStatusMessage( (_("Splitting centerline"),) )
             # Compute output
-            self.logic.splitCenterlines(inputCenterline.GetPolyData()) # Once only for all selections
+            splitCenterlines = self.logic.splitCenterlines(inputCenterline.GetPolyData()) # Once only for all selections
             shFolderId = -1
             
             # The total procesing time is significantly reduced when there are too many components.
@@ -306,6 +315,15 @@ class CenterlineDisassemblyWidget(ScriptedLoadableModuleWidget, VTKObservationMi
                                                                     pairTypeLabels[pairType], shAngleFolderId)
                             self._createJunctionAngleComponent(junctionAngle, shPairTypeFolderIds[pairType])
                         
+                        # A drawing of the centerline and its angles, shown in the slice views
+                        try:
+                            self._createJunctionAngleDiagram(junctionAngles, splitCenterlines,
+                                                             componentLabel + " - " + inputCenterline.GetName(),
+                                                             self._surfacePolyData())
+                        except Exception as e:
+                            logging.warning(_("Failed to create the junction angle diagram: {error}").format(
+                                            error=str(e)))
+                        
                 elif component == CENTERLINES_ITEM_ID:
                     centerlinesPolyDatas = self.logic.processCenterlineIds()
                     if (len(centerlinesPolyDatas)):
@@ -385,12 +403,19 @@ class CenterlineDisassemblyWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         return curve
 
     def _createBifurcationVectorComponent(self, branch, parentFolderId, showCurveName):
-        """Create a curve for the segment over which the direction of a branch was measured."""
+        """Create a curve for the segment over which the direction of a branch was measured.
+        A branch whose vector has no length has no direction, it cannot be shown.
+        """
+        if branch["vectorLength"] <= minimumVectorLength:
+            return None
         name = slicer.mrmlScene.GenerateUniqueName(_("Bifurcation_Vector"))
         curve = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsCurveNode", name)
         curve.CreateDefaultDisplayNodes()
         curve.GetDisplayNode().SetPropertiesLabelVisibility(showCurveName)
         curve.GetDisplayNode().SetSelectedColor([1.0, 0.5, 0.0])
+        # A measured segment is inside the vessel, like the annotations
+        curve.GetDisplayNode().SetOccludedVisibility(True)
+        curve.GetDisplayNode().SetOccludedOpacity(occludedOpacity)
         curve.SetNumberOfPointsPerInterpolatingSegment(1)
         basePosition = branch["basePosition"]
         curve.AddControlPoint(vtk.vtkVector3d(basePosition))
@@ -402,27 +427,257 @@ class CenterlineDisassemblyWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         return curve
 
     def _createJunctionAngleComponent(self, junctionAngle, parentFolderId):
-        """Create an angle markup that shows a measured angle in 3D views."""
+        """Create an angle markup that shows a measured angle in 3D views.
+        A pair with a branch that has no direction has no angle: its control points would be at the same
+        position, which VTK cannot measure an angle from. Such a pair is in the table only.
+        """
+        if math.isnan(junctionAngle["angleDegrees"]):
+            return None
         pairType = self.logic.junctionAnglePairType(junctionAngle["branch1Role"], junctionAngle["branch2Role"])
         colors = {"child-child": [1.0, 1.0, 0.0], "parent-child": [0.0, 1.0, 1.0], "parent-parent": [1.0, 1.0, 1.0]}
-        name = slicer.mrmlScene.GenerateUniqueName(_("Junction_Angle") + "_%d-%d" % (
-                   junctionAngle["branch1GroupId"], junctionAngle["branch2GroupId"]))
-        angleNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsAngleNode", name)
+        angleNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsAngleNode", _("Junction_Angle"))
         angleNode.CreateDefaultDisplayNodes()
+
+        # The rays are drawn several times longer than the measured segments, to be readable next to the
+        # vessel. The angle depends on their directions only, and the bifurcation vector curves show over
+        # what distance a direction was actually measured.
+        junctionPosition = junctionAngle["junctionPosition"]
+
+        def rayEndPosition(positionKey):
+            position = junctionAngle[positionKey]
+            return [junctionPosition[i] + (position[i] - junctionPosition[i]) * junctionAngleRayScale
+                    for i in range(3)]
+
         # The angle is measured at the second control point, which is the bifurcation origin
-        angleNode.AddControlPoint(vtk.vtkVector3d(junctionAngle["branch1Position"]))
-        angleNode.AddControlPoint(vtk.vtkVector3d(junctionAngle["junctionPosition"]))
-        angleNode.AddControlPoint(vtk.vtkVector3d(junctionAngle["branch2Position"]))
+        angleNode.AddControlPoint(vtk.vtkVector3d(rayEndPosition("branch1Position")))
+        angleNode.AddControlPoint(vtk.vtkVector3d(junctionPosition))
+        angleNode.AddControlPoint(vtk.vtkVector3d(rayEndPosition("branch2Position")))
         angleNode.SetAttribute("BifurcationGroupId", str(junctionAngle["bifurcationGroupId"]))
-        angleNode.GetDisplayNode().SetSelectedColor(colors[pairType])
-        angleNode.GetDisplayNode().SetPointLabelsVisibility(False)
-        # Shows the name of the annotation and the measured angle in 3D views
-        angleNode.GetDisplayNode().SetPropertiesLabelVisibility(True)
+        angleNode.SetAttribute("Branch1GroupId", str(junctionAngle["branch1GroupId"]))
+        angleNode.SetAttribute("Branch2GroupId", str(junctionAngle["branch2GroupId"]))
+
+        # The label of an annotation is its name followed by its measurements. Only the angle value is
+        # wanted, so the value becomes the name and the measurement is not printed after it. Which pair of
+        # branches an annotation belongs to is told by its folder, its color and its attributes.
+        angleNode.GetMeasurement("angle").SetPrintFormat("")
+        angleNode.SetName(_("{angle:.1f}°").format(angle=junctionAngle["angleDegrees"]))
+
+        displayNode = angleNode.GetDisplayNode()
+        displayNode.SetSelectedColor(colors[pairType])
+        displayNode.SetPointLabelsVisibility(False)
+        displayNode.SetPropertiesLabelVisibility(True)
+        # A point glyph would only hide the vessel: the rays and the arc show where the angle is
+        displayNode.SetGlyphType(slicer.vtkMRMLMarkupsDisplayNode.Vertex2D)
+        displayNode.SetTextScale(junctionAngleTextScale)
+        # An annotation is inside the vessel: without this it is hidden by an opaque surface
+        displayNode.SetOccludedVisibility(True)
+        displayNode.SetOccludedOpacity(occludedOpacity)
         # A measurement result, it must not be changed by moving a control point
         angleNode.SetLocked(True)
         self._reparentNodeToSubjectHierarchyFolderNode(parentFolderId, angleNode)
         return angleNode
     
+    def _createJunctionAngleDiagram(self, junctionAngles, splitCenterlines, baseName, surfacePolyData = None):
+        """Draw the centerline and its junction angles, and show the drawing in the slice views.
+        The centerline is drawn to scale, projected onto the plane that spreads it the most and turned so
+        that the inlet is at the bottom, so the drawing follows the anatomy. The outline of the vessel is
+        drawn as well if a surface is given. What is labelled and which angles are shown is told by the
+        options of the 'Junction angle diagram' section. The drawing is a picture, it is loaded as a
+        volume so that it is stored with the scene.
+        """
+        if (not junctionAngles) or (not splitCenterlines) or (splitCenterlines.GetNumberOfPoints() == 0):
+            return None
+
+        import numpy as np
+        from vtk.util import numpy_support
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        showChildChildAngles = int(self._parameterNode.GetParameter(ROLE_DIAGRAM_CHILD_CHILD_ANGLES)) != 0
+        showParentChildAngles = int(self._parameterNode.GetParameter(ROLE_DIAGRAM_PARENT_CHILD_ANGLES)) != 0
+        labelBifurcations = int(self._parameterNode.GetParameter(ROLE_DIAGRAM_LABEL_BIFURCATIONS)) != 0
+        labelBranches = int(self._parameterNode.GetParameter(ROLE_DIAGRAM_LABEL_BRANCHES)) != 0
+        blankingArray = splitCenterlines.GetCellData().GetArray(blankingArrayName)
+        groupIdsArray = splitCenterlines.GetCellData().GetArray(groupIdsArrayName)
+        figure = plt.figure(figsize=(9.0, 7.0), dpi=150)
+        axes = figure.add_subplot(1, 1, 1)
+
+        # The plane of the drawing is the plane of the two directions along which the centerline spreads
+        # the most, so that as little as possible of the tree is seen edge on.
+        centerlinePoints = numpy_support.vtk_to_numpy(splitCenterlines.GetPoints().GetData())
+        origin = centerlinePoints.mean(axis=0)
+        principalDirections = np.linalg.svd(centerlinePoints - origin, full_matrices=False)[2]
+
+        def projectOnPlane(position):
+            offset = np.array(position) - origin
+            return (float(np.dot(offset, principalDirections[0])), float(np.dot(offset, principalDirections[1])))
+
+        # Turn the drawing so that the inlet is at the bottom
+        rotationAngle = 0.0
+        inletPosition = self.logic.inletPosition()
+        if inletPosition is not None:
+            projectedInlet = projectOnPlane(inletPosition)
+            if (abs(projectedInlet[0]) > minimumVectorLength) or (abs(projectedInlet[1]) > minimumVectorLength):
+                rotationAngle = -math.pi / 2.0 - math.atan2(projectedInlet[1], projectedInlet[0])
+        cosineOfRotation = math.cos(rotationAngle)
+        sineOfRotation = math.sin(rotationAngle)
+
+        def project(position):
+            x, y = projectOnPlane(position)
+            return (x * cosineOfRotation - y * sineOfRotation, x * sineOfRotation + y * cosineOfRotation)
+
+        # The vessel, as a translucent gray silhouette: every triangle of the surface is projected, so
+        # the drawing shows the whole vessel the way a 3D view of a transparent surface does.
+        if surfacePolyData and surfacePolyData.GetNumberOfPoints() > 0:
+            from matplotlib.collections import PolyCollection
+            triangleFilter = vtk.vtkTriangleFilter()
+            triangleFilter.SetInputData(surfacePolyData)
+            triangleFilter.Update()
+            surfaceTriangles = triangleFilter.GetOutput()
+            if surfaceTriangles.GetNumberOfCells() > maximumSilhouetteTriangles:
+                # A dense surface is simplified, drawing every triangle of it would only be slow
+                decimation = vtk.vtkDecimatePro()
+                decimation.SetInputData(surfaceTriangles)
+                decimation.SetTargetReduction(
+                    1.0 - float(maximumSilhouetteTriangles) / surfaceTriangles.GetNumberOfCells())
+                decimation.PreserveTopologyOn()
+                decimation.Update()
+                surfaceTriangles = decimation.GetOutput()
+            surfacePoints = numpy_support.vtk_to_numpy(surfaceTriangles.GetPoints().GetData())
+            surfaceOffsets = surfacePoints - origin
+            planeCoordinates = np.stack([surfaceOffsets @ principalDirections[0],
+                                         surfaceOffsets @ principalDirections[1]], axis=-1)
+            rotation = np.array([[cosineOfRotation, sineOfRotation], [-sineOfRotation, cosineOfRotation]])
+            projectedSurfacePoints = planeCoordinates @ rotation
+            connectivity = numpy_support.vtk_to_numpy(surfaceTriangles.GetPolys().GetData())
+            if (connectivity.size > 0) and (connectivity.size % 4 == 0):
+                triangleIds = connectivity.reshape(-1, 4)[:, 1:]
+                axes.add_collection(PolyCollection(projectedSurfacePoints[triangleIds], facecolors="0.4",
+                                                   edgecolors="none", alpha=silhouetteOpacity, zorder=1))
+
+        labelledGroupIds = set()
+        for cellId in range(splitCenterlines.GetNumberOfCells()):
+            cell = splitCenterlines.GetCell(cellId)
+            if cell.GetNumberOfPoints() < 2:
+                continue
+            projectedPoints = [project(cell.GetPoints().GetPoint(index))
+                               for index in range(cell.GetNumberOfPoints())]
+            isBifurcation = blankingArray and blankingArray.GetTuple1(cellId) == 1
+            axes.plot([point[0] for point in projectedPoints], [point[1] for point in projectedPoints],
+                      color="0.7", linewidth=1.2, solid_capstyle="round", zorder=2)
+            groupId = int(groupIdsArray.GetTuple1(cellId)) if groupIdsArray else -1
+            if labelBranches and (not isBifurcation) and (groupId not in labelledGroupIds):
+                labelledGroupIds.add(groupId)
+                axes.annotate(_("group {groupId}").format(groupId=groupId),
+                              xy=projectedPoints[len(projectedPoints) // 2], xytext=(5, 5),
+                              textcoords="offset points", fontsize=8, color="0.35", zorder=4,
+                              bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="none",
+                                        alpha=0.8))
+
+        anglesOfBifurcation = {}
+        for junctionAngle in junctionAngles:
+            anglesOfBifurcation.setdefault(junctionAngle["bifurcationGroupId"], []).append(junctionAngle)
+        pairTypeColors = {"child-child": "#b8860b", "parent-child": "#00808a", "parent-parent": "0.35"}
+
+        from matplotlib.patches import Arc
+        for bifurcation in self.logic.computeBifurcationVectors():
+            bifurcationGroupId = bifurcation["bifurcationGroupId"]
+            position = project(bifurcation["position"])
+
+            axes.plot(position[0], position[1], marker="o", markersize=5, color="0.15", zorder=4)
+            if labelBifurcations:
+                axes.annotate(_("bifurcation {groupId}").format(groupId=bifurcationGroupId), xy=position,
+                              xytext=(10, 10), textcoords="offset points", fontsize=9, color="0.15",
+                              fontweight="bold", zorder=5,
+                              bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="none",
+                                        alpha=0.8))
+
+            # Every angle is drawn the way its annotation is drawn in 3D: a ray along each of the two
+            # branches, an arc between them and the value. Several angles of one bifurcation get arcs of
+            # growing radius, so that they do not fall onto each other.
+            drawnAngleIndex = 0
+            for junctionAngle in anglesOfBifurcation.get(bifurcationGroupId, []):
+                if math.isnan(junctionAngle["angleDegrees"]):
+                    continue
+                pairType = self.logic.junctionAnglePairType(junctionAngle["branch1Role"],
+                                                            junctionAngle["branch2Role"])
+                if (pairType == "child-child") and (not showChildChildAngles):
+                    continue
+                if (pairType != "child-child") and (not showParentChildAngles):
+                    continue
+                color = pairTypeColors[pairType]
+                rayAngles = []
+                for positionKey in ["branch1Position", "branch2Position"]:
+                    rayEnd = project([bifurcation["position"][index]
+                                      + (junctionAngle[positionKey][index] - bifurcation["position"][index])
+                                      * junctionAngleRayScale for index in range(3)])
+                    axes.plot([position[0], rayEnd[0]], [position[1], rayEnd[1]],
+                              color=color, linewidth=1.8, solid_capstyle="round", zorder=4)
+                    rayAngles.append(math.degrees(math.atan2(rayEnd[1] - position[1], rayEnd[0] - position[0])))
+                    rayAngles[-1] = rayAngles[-1] % 360.0
+                rayLength = max(minimumVectorLength,
+                                math.sqrt((rayEnd[0] - position[0]) ** 2 + (rayEnd[1] - position[1]) ** 2))
+                arcRadius = rayLength * (0.45 + 0.22 * drawnAngleIndex)
+                startAngle, endAngle = sorted(rayAngles)
+                if endAngle - startAngle > 180.0:
+                    startAngle, endAngle = endAngle, startAngle + 360.0
+                axes.add_patch(Arc(position, 2.0 * arcRadius, 2.0 * arcRadius, theta1=startAngle,
+                                   theta2=endAngle, color=color, linewidth=1.5, zorder=4))
+                labelAngle = math.radians((startAngle + endAngle) / 2.0)
+                axes.annotate("%.1f°" % junctionAngle["angleDegrees"],
+                              xy=(position[0] + arcRadius * 1.15 * math.cos(labelAngle),
+                                  position[1] + arcRadius * 1.15 * math.sin(labelAngle)),
+                              fontsize=10, color=color, ha="center", va="center", zorder=5,
+                              bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="none",
+                                        alpha=0.8))
+                drawnAngleIndex += 1
+
+        axes.set_aspect("equal")
+        axes.set_title(baseName, fontsize=11)
+        axes.margins(0.12)
+        axes.axis("off")
+
+        # A scale bar, since the drawing is to scale
+        xLimits = axes.get_xlim()
+        yLimits = axes.get_ylim()
+        roughLength = max(1e-3, (xLimits[1] - xLimits[0]) / 5.0)
+        magnitude = 10.0 ** math.floor(math.log10(roughLength))
+        scaleBarLength = magnitude
+        for step in [1.0, 2.0, 5.0, 10.0]:
+            if step * magnitude <= roughLength:
+                scaleBarLength = step * magnitude
+        scaleBarPosition = (xLimits[0] + (xLimits[1] - xLimits[0]) * 0.04,
+                            yLimits[0] + (yLimits[1] - yLimits[0]) * 0.06)
+        axes.plot([scaleBarPosition[0], scaleBarPosition[0] + scaleBarLength],
+                  [scaleBarPosition[1], scaleBarPosition[1]], color="0.15", linewidth=2.5)
+        axes.annotate(_("{length:g} mm").format(length=scaleBarLength),
+                      xy=(scaleBarPosition[0] + scaleBarLength / 2.0, scaleBarPosition[1]),
+                      xytext=(0, 4), textcoords="offset points", fontsize=8, color="0.15", ha="center")
+        from matplotlib.lines import Line2D
+        legendEntries = []
+        if showChildChildAngles:
+            legendEntries.append((_("child-child angles"), pairTypeColors["child-child"]))
+        if showParentChildAngles:
+            legendEntries.append((_("parent-child angles"), pairTypeColors["parent-child"]))
+        if surfacePolyData and surfacePolyData.GetNumberOfPoints() > 0:
+            legendEntries.append((_("vessel"), "0.4"))
+        axes.legend(handles=[Line2D([], [], color=legendColor, linewidth=2.5, label=legendText)
+                             for legendText, legendColor in legendEntries],
+                    loc="upper left", frameon=False, fontsize=9, handlelength=1.2,
+                    ncol=len(legendEntries))
+        figure.tight_layout()
+
+        diagramPath = os.path.join(slicer.util.tempDirectory(),
+                                   slicer.mrmlScene.GenerateUniqueName(baseName) + ".png")
+        figure.savefig(diagramPath, facecolor="white")
+        plt.close(figure)
+
+        diagramNode = slicer.util.loadVolume(diagramPath, {"singleFile": True, "show": False})
+        diagramNode.SetName(slicer.mrmlScene.GenerateUniqueName(baseName + _(" diagram")))
+        slicer.util.setSliceViewerLayers(background=diagramNode, fit=True)
+        return diagramNode
+
     def showStatusMessage(self, messages, console = False) -> None:
         separator = " "
         msg = separator.join(messages)
@@ -431,9 +686,59 @@ class CenterlineDisassemblyWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         if console:
             logging.info(msg)
 
+    def _diagramOptionCheckBoxes(self):
+        """The check boxes that tell what the junction angle diagram shows, with their parameter roles."""
+        return [(self.ui.diagramChildChildAnglesCheckBox, ROLE_DIAGRAM_CHILD_CHILD_ANGLES),
+                (self.ui.diagramParentChildAnglesCheckBox, ROLE_DIAGRAM_PARENT_CHILD_ANGLES),
+                (self.ui.diagramLabelBifurcationsCheckBox, ROLE_DIAGRAM_LABEL_BIFURCATIONS),
+                (self.ui.diagramLabelBranchesCheckBox, ROLE_DIAGRAM_LABEL_BRANCHES)]
+
     def onCenterlineChanged(self, node):
         if self._parameterNode:
             self._parameterNode.SetNodeReferenceID(ROLE_INPUT_CENTERLINE, node.GetID() if node else None)
+
+    def onSurfaceChanged(self, node):
+        if self._parameterNode:
+            self._parameterNode.SetNodeReferenceID(ROLE_INPUT_SURFACE, node.GetID() if node else None)
+        self._updateSegmentSelectorVisibility()
+
+    def onSegmentChanged(self, segmentId):
+        if self._parameterNode:
+            self._parameterNode.SetParameter(ROLE_INPUT_SEGMENT_ID, segmentId if segmentId else "")
+
+    def _updateSegmentSelectorVisibility(self):
+        """A segment can only be picked if the surface comes from a segmentation."""
+        surfaceNode = self.ui.inputSurfaceSelector.currentNode()
+        isSegmentation = (surfaceNode is not None) and surfaceNode.IsA("vtkMRMLSegmentationNode")
+        self.ui.inputSegmentLabel.setVisible(isSegmentation)
+        self.ui.inputSegmentSelectorWidget.setVisible(isSegmentation)
+        if isSegmentation:
+            self.ui.inputSegmentSelectorWidget.setCurrentNode(surfaceNode)
+
+    def _surfacePolyData(self):
+        """The surface whose outline the diagram draws, from a model or from a segment."""
+        surfaceNode = self._parameterNode.GetNodeReference(ROLE_INPUT_SURFACE) if self._parameterNode else None
+        if not surfaceNode:
+            return None
+        if surfaceNode.IsA("vtkMRMLModelNode"):
+            return surfaceNode.GetPolyData()
+        if surfaceNode.IsA("vtkMRMLSegmentationNode"):
+            segmentId = self._parameterNode.GetParameter(ROLE_INPUT_SEGMENT_ID)
+            if not segmentId:
+                segmentIds = vtk.vtkStringArray()
+                surfaceNode.GetSegmentation().GetSegmentIDs(segmentIds)
+                if segmentIds.GetNumberOfValues() == 0:
+                    return None
+                segmentId = segmentIds.GetValue(0)
+            polyData = vtk.vtkPolyData()
+            surfaceNode.CreateClosedSurfaceRepresentation()
+            surfaceNode.GetClosedSurfaceRepresentation(segmentId, polyData)
+            return polyData
+        return None
+
+    def onDiagramOptionToggled(self, role, checked):
+        if self._parameterNode:
+            self._parameterNode.SetParameter(role, str(1) if checked else str(0))
 
     def onCreateModels(self, checked):
         if self._parameterNode:
@@ -460,6 +765,13 @@ class CenterlineDisassemblyWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         
         junctionAnglesModelIndex = self.ui.componentCheckableComboBox.checkableModel().index(3, 0)
         self._parameterNode.SetParameter(ROLE_CREATE_JUNCTION_ANGLES, str(self.ui.componentCheckableComboBox.checkState(junctionAnglesModelIndex)))
+        self._updateDiagramSectionVisibility()
+
+    def _updateDiagramSectionVisibility(self):
+        """The diagram belongs to the junction angles, it is hidden while they are not selected."""
+        junctionAnglesModelIndex = self.ui.componentCheckableComboBox.checkableModel().index(3, 0)
+        self.ui.diagramCollapsibleButton.setVisible(
+            self.ui.componentCheckableComboBox.checkState(junctionAnglesModelIndex) != qt.Qt.Unchecked)
 
     def updateGUIFromParameterNode(self):
         if self._parameterNode is None or self._updatingGUIFromParameterNode:
@@ -469,6 +781,11 @@ class CenterlineDisassemblyWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         self._updatingGUIFromParameterNode = True
 
         self.ui.inputCenterlineSelector.setCurrentNode(self._parameterNode.GetNodeReference(ROLE_INPUT_CENTERLINE))
+        self.ui.inputSurfaceSelector.setCurrentNode(self._parameterNode.GetNodeReference(ROLE_INPUT_SURFACE))
+        self._updateSegmentSelectorVisibility()
+        self.ui.inputSegmentSelectorWidget.setCurrentSegmentID(self._parameterNode.GetParameter(ROLE_INPUT_SEGMENT_ID))
+        for checkBox, role in self._diagramOptionCheckBoxes():
+            checkBox.setChecked(int(self._parameterNode.GetParameter(role)))
         self.ui.optionCreateModelsToolButton.setChecked(int(self._parameterNode.GetParameter(ROLE_CREATE_MODELS)))
         self.ui.optionCreateCurvesMenuButton.setChecked(int(self._parameterNode.GetParameter(ROLE_CREATE_CURVES)))
         self._createdCurveVisibilityAction.setChecked(int(self._parameterNode.GetParameter(ROLE_SHOW_CURVE_NAMES)))
@@ -486,6 +803,7 @@ class CenterlineDisassemblyWidget(ScriptedLoadableModuleWidget, VTKObservationMi
         junctionAnglesModelIndex = self.ui.componentCheckableComboBox.checkableModel().index(3, 0)
         self.ui.componentCheckableComboBox.setCheckState(junctionAnglesModelIndex, int(self._parameterNode.GetParameter(ROLE_CREATE_JUNCTION_ANGLES)))
         self.ui.componentCheckableComboBox.blockSignals(wasBlocked)
+        self._updateDiagramSectionVisibility()
 
         self._updatingGUIFromParameterNode = False
 #
@@ -943,6 +1261,48 @@ class CenterlineDisassemblyLogic(ScriptedLoadableModuleLogic):
                         })
         return junctionAngles
 
+    def inletPosition(self):
+        """Position of the inlet of the centerline.
+        The inlet is the free end of the branch that leads into a bifurcation without coming out of one,
+        which is the branch the centerline extraction started from.
+        :return: the position, or None if the centerline does not have any bifurcation
+        """
+
+        bifurcations = self.computeBifurcationVectors()
+        if not bifurcations:
+            return None
+
+        parentGroups = []
+        childGroupIds = set()
+        for bifurcation in bifurcations:
+            for groupId in sorted(bifurcation["branches"].keys()):
+                if bifurcation["branches"][groupId]["role"] == "Parent":
+                    parentGroups.append((groupId, bifurcation["position"]))
+                else:
+                    childGroupIds.add(groupId)
+        rootGroups = sorted((groupId, position) for groupId, position in parentGroups
+                            if groupId not in childGroupIds)
+        if not rootGroups:
+            return None
+        rootGroupId, bifurcationPosition = rootGroups[0]
+
+        import vtkvmtkComputationalGeometryPython as vtkvmtkComputationalGeometry
+        centerlineUtilities = vtkvmtkComputationalGeometry.vtkvmtkCenterlineUtilities()
+        groupCellIds = vtk.vtkIdList()
+        centerlineUtilities.GetGroupUniqueCellIds(self._splitCenterlines, groupIdsArrayName,
+                                                  rootGroupId, groupCellIds)
+        inletPosition = None
+        largestDistance = -1.0
+        for index in range(groupCellIds.GetNumberOfIds()):
+            cell = self._splitCenterlines.GetCell(groupCellIds.GetId(index))
+            for pointIndex in [0, cell.GetNumberOfPoints() - 1]:
+                position = cell.GetPoints().GetPoint(pointIndex)
+                distance = vtk.vtkMath.Distance2BetweenPoints(position, bifurcationPosition)
+                if distance > largestDistance:
+                    largestDistance = distance
+                    inletPosition = list(position)
+        return inletPosition
+
     def populateJunctionAnglesTable(self, tableNode, junctionAngles):
         """Write junction angle results in a table node, one row for each pair of branches."""
 
@@ -1396,8 +1756,19 @@ bifurcationGroupIdsArrayName = 'BifurcationGroupIds'
 upstreamOrientation = 0
 # Vectors shorter than this, in mm, do not give a direction
 minimumVectorLength = 1e-6
+# Style of the junction angle annotations. The rays are drawn this many times longer than the measured
+# segments, and the text is larger than the default scale of 3.0.
+junctionAngleRayScale = 3.0
+junctionAngleTextScale = 5.0
+# How much of an annotation is seen where the vessel surface hides it
+occludedOpacity = 0.6
+# How solid a triangle of the vessel is in the diagram, and how many of them are drawn at most
+silhouetteOpacity = 0.18
+maximumSilhouetteTriangles = 40000
 
 ROLE_INPUT_CENTERLINE = "InputCenterline"
+ROLE_INPUT_SURFACE = "InputSurface"
+ROLE_INPUT_SEGMENT_ID = "InputSegmentID"
 ROLE_CREATE_MODELS = "CreateModels"
 ROLE_CREATE_CURVES = "CreateCurves"
 ROLE_SHOW_CURVE_NAMES = "ShowCurveNames"
@@ -1405,3 +1776,7 @@ ROLE_CREATE_BIFURCATIONS = "CreateBifurcations"
 ROLE_CREATE_BRANCHES = "CreateBranches"
 ROLE_CREATE_CENTERLINES = "CreateCenterlines"
 ROLE_CREATE_JUNCTION_ANGLES = "CreateJunctionAngles"
+ROLE_DIAGRAM_CHILD_CHILD_ANGLES = "DiagramChildChildAngles"
+ROLE_DIAGRAM_PARENT_CHILD_ANGLES = "DiagramParentChildAngles"
+ROLE_DIAGRAM_LABEL_BIFURCATIONS = "DiagramLabelBifurcations"
+ROLE_DIAGRAM_LABEL_BRANCHES = "DiagramLabelBranches"

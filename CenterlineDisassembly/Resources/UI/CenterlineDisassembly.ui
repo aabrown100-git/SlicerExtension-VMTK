@@ -125,6 +125,132 @@
     </widget>
    </item>
    <item>
+    <widget class="ctkCollapsibleButton" name="diagramCollapsibleButton">
+     <property name="text">
+      <string>Junction angle diagram</string>
+     </property>
+     <property name="collapsed">
+      <bool>true</bool>
+     </property>
+     <layout class="QVBoxLayout" name="diagramVerticalLayout">
+      <item>
+       <layout class="QFormLayout" name="diagramFormLayout">
+        <item row="0" column="0">
+         <widget class="QLabel" name="inputSurfaceLabel">
+          <property name="text">
+           <string>Vessel surface:</string>
+          </property>
+         </widget>
+        </item>
+        <item row="0" column="1">
+         <widget class="qMRMLNodeComboBox" name="inputSurfaceSelector">
+          <property name="toolTip">
+           <string>Optional. The surface or the segmentation the centerline was extracted from. Its outline is drawn in the diagram.</string>
+          </property>
+          <property name="nodeTypes">
+           <stringlist notr="true">
+            <string>vtkMRMLModelNode</string>
+            <string>vtkMRMLSegmentationNode</string>
+           </stringlist>
+          </property>
+          <property name="showChildNodeTypes">
+           <bool>false</bool>
+          </property>
+          <property name="noneEnabled">
+           <bool>true</bool>
+          </property>
+          <property name="addEnabled">
+           <bool>false</bool>
+          </property>
+          <property name="removeEnabled">
+           <bool>true</bool>
+          </property>
+          <property name="editEnabled">
+           <bool>true</bool>
+          </property>
+          <property name="renameEnabled">
+           <bool>true</bool>
+          </property>
+          <property name="selectNodeUponCreation">
+           <bool>false</bool>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="0">
+         <widget class="QLabel" name="inputSegmentLabel">
+          <property name="text">
+           <string>Segment:</string>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="1">
+         <widget class="qMRMLSegmentSelectorWidget" name="inputSegmentSelectorWidget">
+          <property name="toolTip">
+           <string>The segment of the segmentation whose outline is drawn.</string>
+          </property>
+          <property name="segmentationNodeSelectorVisible">
+           <bool>false</bool>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="diagramChildChildAnglesCheckBox">
+        <property name="toolTip">
+         <string>Show the angles between the child branches of a bifurcation, its branching angles.</string>
+        </property>
+        <property name="text">
+         <string>Child-child angles</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="diagramParentChildAnglesCheckBox">
+        <property name="toolTip">
+         <string>Show the angles between the parent branch of a bifurcation and each of its child branches.</string>
+        </property>
+        <property name="text">
+         <string>Parent-child angles</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="diagramLabelBifurcationsCheckBox">
+        <property name="toolTip">
+         <string>Label every bifurcation with its GroupId.</string>
+        </property>
+        <property name="text">
+         <string>Label bifurcations</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="diagramLabelBranchesCheckBox">
+        <property name="toolTip">
+         <string>Label every branch with its GroupId.</string>
+        </property>
+        <property name="text">
+         <string>Label branches</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
     <spacer name="verticalSpacer">
      <property name="orientation">
       <enum>Qt::Vertical</enum>
@@ -214,6 +340,11 @@ Upon curve creation, the visibility of the names can be specified via the menu.<
    <container>1</container>
   </customwidget>
   <customwidget>
+   <class>qMRMLSegmentSelectorWidget</class>
+   <extends>qMRMLWidget</extends>
+   <header>qMRMLSegmentSelectorWidget.h</header>
+  </customwidget>
+  <customwidget>
    <class>qMRMLWidget</class>
    <extends>QWidget</extends>
    <header>qMRMLWidget.h</header>
@@ -222,6 +353,38 @@ Upon curve creation, the visibility of the names can be specified via the menu.<
  </customwidgets>
  <resources/>
  <connections>
+  <connection>
+   <sender>CenterlineDisassembly</sender>
+   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
+   <receiver>inputSegmentSelectorWidget</receiver>
+   <slot>setMRMLScene(vtkMRMLScene*)</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>4</x>
+     <y>4</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>4</x>
+     <y>4</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>CenterlineDisassembly</sender>
+   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
+   <receiver>inputSurfaceSelector</receiver>
+   <slot>setMRMLScene(vtkMRMLScene*)</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>4</x>
+     <y>4</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>4</x>
+     <y>4</y>
+    </hint>
+   </hints>
+  </connection>
   <connection>
    <sender>CenterlineDisassembly</sender>
    <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
