@@ -488,16 +488,6 @@
         </property>
         <layout class="QVBoxLayout" name="clipPointNamesLayout">
          <item>
-          <widget class="QLabel" name="clipPointNamesHintLabel">
-           <property name="text">
-            <string>Name each vessel end. These names travel through meshing.</string>
-           </property>
-           <property name="wordWrap">
-            <bool>true</bool>
-           </property>
-          </widget>
-         </item>
-         <item>
           <widget class="QTableWidget" name="clipPointNamesTable">
            <property name="toolTip">
             <string>Every clip point and the name of the vessel end it marks, in clip point order. Click a name to edit it. These are the names the caps carry downstream - into the volume mesh, the mesh-surfaces file names, and the boundary condition names a solver reports results under - so naming here means not naming again after meshing. Selecting a row also selects that clip point in the 3D views, so you can see which end you are naming.</string>
