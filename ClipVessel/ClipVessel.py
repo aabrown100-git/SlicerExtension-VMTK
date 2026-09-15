@@ -38,6 +38,29 @@ _DEFAULT_MODEL_FACE_ID_ARRAY_NAME = "ModelFaceID"
 _DEFAULT_BOUNDARY_LABELS_ARRAY_NAME = "BoundaryLabels"
 _DEFAULT_BOUNDARY_POINT_ORDER_ARRAY_NAME = "BoundaryPointOrder"
 
+# The vessel names offered for a clip point, and where any the operator adds are kept.
+#
+# A clip point's label is the name its cap carries downstream, so this is where the naming of a
+# case actually happens - before meshing, rather than after it, which is the point: nobody should
+# wait fifteen minutes for a mesh to find out what they have to type. The alternative to a list is
+# right-click-rename on each point, which on a case with two dozen vessel ends is most of the
+# work.
+#
+# Deliberately short, and deliberately not a constraint. It holds the names that recur across
+# cases - the trunks, which are the ones a boundary condition is usually written for - and a name
+# typed into the box is added to it and saved with the scene. The distal branches of a big tree
+# are named positionally (lpa_a, lpa_b, ...) and there is no use listing those in advance.
+_DEFAULT_CLIP_POINT_NAMES = (
+    "Inlet", "Outlet",
+    "aorta", "IVC", "SVC", "RSVC", "LSVC", "azygous_vein",
+    "left_innominate_vein", "right_innominate_vein",
+    "left_hepatic_vein", "middle_hepatic_vein", "right_hepatic_vein",
+    "coronary_sinus", "conduit", "LPA", "RPA",
+)
+
+# Names the operator has added, carried into a saved scene so that a case keeps its vocabulary.
+_CLIP_POINT_NAME_LIST_PARAMETER = "ClipPointNameList"
+
 # Where a face id's *name* is to be found, recorded on the output model node so that it travels:
 # the node reference points at the clip points markups node whose control point labels the names
 # are, and the attribute says which control point each face id came from. A face id is a number
@@ -139,6 +162,7 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self._normalHandleDistance = 1.0
     self._planeEditing = False
     self._updatingManualPlaneButtons = False
+    self._updatingClipPointName = False
     self._preprocessedCacheKey = None
     self._preprocessedPolyData = None
     self._applying = False
@@ -249,6 +273,12 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.enableManualPlaneOrigin.connect("toggled(bool)", self.onEnableManualPlaneOriginToggled)
     self.ui.enableManualPlaneNormal.connect("toggled(bool)", self.onEnableManualPlaneNormalToggled)
     self.ui.extensionScaleWidget.connect('valueChanged(double)', self.onExtensionScaleChanged)
+    # Two signals, not currentTextChanged: that one fires on every keystroke, which would rename
+    # the point a character at a time and put a scene-modified event behind each one. "activated"
+    # is a deliberate pick from the list, editingFinished a deliberate end to typing.
+    self.ui.clipPointNameComboBox.connect('activated(int)', self.onClipPointNameChosen)
+    self.ui.clipPointNameComboBox.lineEdit().connect('editingFinished()', self.onClipPointNameChosen)
+    self.populateClipPointNames()
     self.ui.enableManualPlaneOrigin.setIcon(qt.QIcon(self.resourcePath('Icons/ManualPlaneOrigin.svg')))
     self.ui.enableManualPlaneNormal.setIcon(qt.QIcon(self.resourcePath('Icons/ManualPlaneNormal.svg')))
     # None of these carries a checked state. A checked button would be saying what the display
@@ -363,6 +393,9 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.advancedCollapsibleButton.enabled = parameterNode is not None
     if parameterNode is None:
         return
+    # A loaded scene brings its own added names with it, so the list is rebuilt here rather
+    # than only at setup, when there was no parameter node to read them from.
+    self.populateClipPointNames()
 
     if self.updatingGUIFromParameterNode:
         return
@@ -817,8 +850,95 @@ class ClipVesselWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     self.ui.enableManualPlaneOrigin.checked = pointId is not None and pointId in self._manualPlaneOrigins
     self.ui.enableManualPlaneNormal.checked = pointId is not None and pointId in self._manualPlaneNormals
     self.ui.extensionScaleWidget.value = self._extensionLengthScaleFactors.get(pointId, 1.0) if pointId is not None else 1.0
+    self.updateClipPointNameBox(pointId)
     self._updatingManualPlaneButtons = False
     self.updateClipPointsSnapMode()
+
+  # -- naming the clip points --------------------------------------------------------------
+  def clipPointNames(self):
+    """The names offered in the box: the built-in ones, plus any this scene has added."""
+    stored = self._parameterNode.GetParameter(_CLIP_POINT_NAME_LIST_PARAMETER) if self._parameterNode else ""
+    added = [name.strip() for name in (stored or "").split("\n") if name.strip()]
+    names = list(_DEFAULT_CLIP_POINT_NAMES)
+    names += [name for name in added if name not in names]
+    return names
+
+  def populateClipPointNames(self):
+    """Fill the box, keeping whatever is typed in it.
+
+    Rebuilding a combo box clears its line edit, which would wipe a name half typed when the
+    list grows underneath it - so the text is put back.
+    """
+    self._updatingClipPointName = True
+    try:
+        typed = self.ui.clipPointNameComboBox.currentText
+        self.ui.clipPointNameComboBox.clear()
+        self.ui.clipPointNameComboBox.addItems(self.clipPointNames())
+        self.ui.clipPointNameComboBox.currentText = typed
+    finally:
+        self._updatingClipPointName = False
+
+  def updateClipPointNameBox(self, pointId):
+    """Show the selected clip point's own name, or nothing when no point is selected.
+
+    The box is the point's name rather than a name waiting to be applied, so it has to follow
+    the selection: leaving the last point's name in it against a different point is an invitation
+    to rename the wrong vessel.
+    """
+    clipPointsNode = self._parameterNode.GetNodeReference("ClipPoints") if self._parameterNode else None
+    index = self._activeClipPointIndex if pointId is not None else -1
+    self.ui.clipPointNameComboBox.enabled = pointId is not None
+    self.ui.clipPointNameComboBox.toolTip = (
+        self.ui.clipPointNameComboBox.toolTip if pointId is not None
+        else _("Click a clip point in a 3D view to select it, then name it here."))
+    self._updatingClipPointName = True
+    try:
+        if clipPointsNode and 0 <= index < clipPointsNode.GetNumberOfControlPoints():
+            self.ui.clipPointNameComboBox.currentText = clipPointsNode.GetNthControlPointLabel(index)
+        else:
+            self.ui.clipPointNameComboBox.currentText = ""
+    finally:
+        self._updatingClipPointName = False
+
+  def onClipPointNameChosen(self, _index=None):
+    """Give the selected clip point the name in the box.
+
+    The label is the whole of what is stored: a clip point's label is what names its cap
+    downstream, so renaming the point here is the naming step, and there is nothing else to keep
+    in step with it.
+    """
+    if self._updatingClipPointName or self.updatingGUIFromParameterNode:
+        return
+    if not self._planeEditing or self._activeClipPointIndex < 0:
+        return
+    clipPointsNode = self._parameterNode.GetNodeReference("ClipPoints") if self._parameterNode else None
+    if not clipPointsNode or self._activeClipPointIndex >= clipPointsNode.GetNumberOfControlPoints():
+        return
+    name = (self.ui.clipPointNameComboBox.currentText or "").strip()
+    if not name or name == clipPointsNode.GetNthControlPointLabel(self._activeClipPointIndex):
+        # Nothing typed, or nothing changed. An empty box is not a request to unname a point:
+        # clearing it happens on every selection change, and a point with no name at all is one
+        # whose cap arrives unnamed downstream.
+        return
+    clipPointsNode.SetNthControlPointLabel(self._activeClipPointIndex, name)
+    self.rememberClipPointName(name)
+    self.ui.clipStatusLabel.text = _("Clip point named \u201c{name}\u201d. Its cap carries that name "
+                                     "through meshing.").format(name=name)
+    self.ui.clipStatusLabel.styleSheet = ""
+
+  def rememberClipPointName(self, name):
+    """Add a name the operator typed to the list, and keep it with the scene.
+
+    So that a vocabulary is built once rather than retyped: the trunk names recur across cases,
+    and a name that has been used on this anatomy is the one most likely to be wanted again.
+    """
+    if not self._parameterNode or name in self.clipPointNames():
+        return
+    stored = self._parameterNode.GetParameter(_CLIP_POINT_NAME_LIST_PARAMETER) or ""
+    added = [existing.strip() for existing in stored.split("\n") if existing.strip()]
+    added.append(name)
+    self._parameterNode.SetParameter(_CLIP_POINT_NAME_LIST_PARAMETER, "\n".join(added))
+    self.populateClipPointNames()
 
   def onExtensionScaleChanged(self, value=None):
     if self.updatingGUIFromParameterNode or self._updatingManualPlaneButtons:
@@ -1728,7 +1848,11 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     if not parameterNode.GetParameter("SubdivideInputSurface"):
         parameterNode.SetParameter("SubdivideInputSurface", "false")
     if not parameterNode.GetParameter("CapOutputSurface"):
-        parameterNode.SetParameter("CapOutputSurface", "true")
+        # Off by default. The common next step is CFD Mesh Generator, which makes the caps
+        # itself and makes them where they belong - on the inner surface, past a boundary layer.
+        # Capping here only to have them opened again there is a round trip for nothing, and it
+        # is the setting the checkbox in the panel has always shown.
+        parameterNode.SetParameter("CapOutputSurface", "false")
     if parameterNode.GetParameter("CapMethod") not in _CAP_METHOD_IDS:
         parameterNode.SetParameter("CapMethod", _DEFAULT_CAP_METHOD)
     if not parameterNode.GetParameter("CapConstraintFactor"):
