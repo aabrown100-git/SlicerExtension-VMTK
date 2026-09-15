@@ -1,17 +1,21 @@
-"""Naming a clip point from the panel.
+"""Naming the clip points from the panel.
 
-A clip point's label is the name its cap carries downstream, so this box is where the naming of
-a case happens - before meshing rather than after it, which is the point of it: the alternative
-is right-click-rename on each point, and on a case with two dozen vessel ends that is most of
-the work. What has to hold is that the box names the point the operator selected and no other,
-and that it never quietly unnames one.
+A clip point's label is the name its cap carries downstream, so this table is where the naming of
+a case happens - during clipping rather than after meshing, which is the point of it: otherwise
+it means waiting for a mesh to find out what has to be typed, and waiting again for another if
+the meshing parameters change. It replaces right-click-rename on each point, and on a case with
+two dozen vessel ends the thing an operator needs is the list, not a control for whichever point
+happens to be selected.
+
+What has to hold: the table says what the points say, editing a row names that point and no
+other, and it never quietly unnames one.
 """
 
 import unittest
 
 import slicer
 
-from ClipVessel import _DEFAULT_CLIP_POINT_NAMES, _CLIP_POINT_NAME_LIST_PARAMETER
+from ClipVessel import _CLIP_POINT_NAME_COLUMN, _CLIP_POINT_NAME_COLUMNS
 from ClipVesselTestFixture import clipVesselModuleWidget
 
 
@@ -20,104 +24,90 @@ class ClipPointNamesTest(unittest.TestCase):
     def setUp(self):
         slicer.mrmlScene.Clear()
         self.widget = clipVesselModuleWidget()
-        # Slicer owns one widget per module and hands back the same one every time, so the
-        # selection a previous test left on it outlives the scene being cleared. Put it back to
-        # nothing selected, or a test that expects no selection inherits the last one's.
+        # Slicer owns one widget per module and hands back the same one every time, so state a
+        # previous test left on it outlives the scene being cleared.
         self.widget._activeClipPointIndex = -1
         self.widget._activeClipPointId = None
         self.widget._planeEditing = False
-        self.widget.updateManualPlaneButtonStates()
         self.clipPoints = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode",
                                                              "Clip points")
         for label in ("Inlet", "Outlet 1", "Outlet 2"):
             index = self.clipPoints.AddControlPoint([0.0, 0.0, 0.0])
             self.clipPoints.SetNthControlPointLabel(index, label)
         self.widget._parameterNode.SetNodeReferenceID("ClipPoints", self.clipPoints.GetID())
+        self.widget.rebuildClipPointNamesTable()
+        self.table = self.widget.ui.clipPointNamesTable
 
-    def select(self, index):
-        """Select a clip point, as clicking one in a 3D view does."""
-        self.widget._activeClipPointIndex = index
-        self.widget._activeClipPointId = self.clipPoints.GetNthControlPointID(index)
-        self.widget._planeEditing = True
-        self.widget.updateManualPlaneButtonStates()
+    def shown(self):
+        return [self.table.item(row, _CLIP_POINT_NAME_COLUMN).text()
+                for row in range(self.table.rowCount)]
 
     def labels(self):
-        return [self.clipPoints.GetNthControlPointLabel(i) for i in range(3)]
+        return [self.clipPoints.GetNthControlPointLabel(i)
+                for i in range(self.clipPoints.GetNumberOfControlPoints())]
 
-    def test_the_box_is_offered_only_for_a_selected_point(self):
-        """Disabled until a point is selected, and cleared again when the selection ends.
+    def setCell(self, row, text):
+        """Type a name into a row, as editing the cell does."""
+        self.table.item(row, _CLIP_POINT_NAME_COLUMN).setText(text)
+        self.widget.onClipPointNameEdited(row, _CLIP_POINT_NAME_COLUMN)
 
-        The box holds the selected point's own name rather than a name waiting to be applied, so
-        leaving the last point's name in it against no selection - or against a different point -
-        would be an invitation to rename the wrong vessel.
-        """
-        combo = self.widget.ui.clipPointNameComboBox
-        self.assertFalse(combo.enabled)
+    def test_the_table_lists_every_clip_point_in_order(self):
+        """Row order is clip point order, which is also the order the caps are numbered in."""
+        self.assertEqual(self.table.columnCount, len(_CLIP_POINT_NAME_COLUMNS))
+        self.assertEqual(self.table.rowCount, 3)
+        self.assertEqual([self.table.item(row, 0).text() for row in range(3)], ["1", "2", "3"])
+        self.assertEqual(self.shown(), ["Inlet", "Outlet 1", "Outlet 2"])
 
-        self.select(1)
-        self.assertTrue(combo.enabled)
-        self.assertEqual(combo.currentText, "Outlet 1")
+    def test_only_the_name_column_can_be_edited(self):
+        import qt
+        self.assertTrue(self.table.item(0, _CLIP_POINT_NAME_COLUMN).flags() & qt.Qt.ItemIsEditable)
+        self.assertFalse(self.table.item(0, 0).flags() & qt.Qt.ItemIsEditable)
 
-        self.select(2)
-        self.assertEqual(combo.currentText, "Outlet 2")
-
-        self.widget.finishPlaneEditing()
-        self.assertFalse(combo.enabled)
-        self.assertEqual(combo.currentText, "")
-
-    def test_the_list_offers_the_built_in_names(self):
-        combo = self.widget.ui.clipPointNameComboBox
-        offered = [combo.itemText(index) for index in range(combo.count)]
-        self.assertEqual(offered[:len(_DEFAULT_CLIP_POINT_NAMES)], list(_DEFAULT_CLIP_POINT_NAMES))
-
-    def test_picking_a_name_renames_that_point_and_no_other(self):
-        combo = self.widget.ui.clipPointNameComboBox
-        self.select(1)
-        index = combo.findText("RSVC")
-        self.assertGreaterEqual(index, 0, "RSVC should be one of the built-in names")
-        combo.currentIndex = index
-        self.widget.onClipPointNameChosen(index)
+    def test_editing_a_row_names_that_point_and_no_other(self):
+        self.setCell(1, "RSVC")
         self.assertEqual(self.labels(), ["Inlet", "RSVC", "Outlet 2"])
+        self.assertEqual(self.shown(), ["Inlet", "RSVC", "Outlet 2"])
 
-    def test_a_typed_name_is_kept_and_offered_again(self):
-        """A vocabulary is built once rather than retyped.
+    def test_an_empty_cell_does_not_unname_a_point(self):
+        """Clearing a cell is too easy to do by accident, and a point with no label at all is one
+        whose cap arrives unnamed downstream. The name it had goes back into the cell."""
+        self.setCell(0, "")
+        self.assertEqual(self.labels(), ["Inlet", "Outlet 1", "Outlet 2"])
+        self.assertEqual(self.shown(), ["Inlet", "Outlet 1", "Outlet 2"])
 
-        The trunk names recur across cases, and a name already used on this anatomy is the one
-        most likely to be wanted again. Saved on the parameter node, so it comes back with the
-        scene.
+    def test_a_rename_from_elsewhere_reaches_the_table(self):
+        """The markups module, or a script, can rename a point while this panel is open.
+
+        Renames arrive as modified events, and can arrive with no plane being edited, which is
+        why the refresh sits ahead of the guard in onClipPointModified.
         """
-        combo = self.widget.ui.clipPointNameComboBox
-        self.select(1)
-        combo.currentText = "lpa_a"
-        self.widget.onClipPointNameChosen()
+        self.clipPoints.SetNthControlPointLabel(2, "azygous_vein")
+        self.assertEqual(self.shown(), ["Inlet", "Outlet 1", "azygous_vein"])
 
-        self.assertEqual(self.labels(), ["Inlet", "lpa_a", "Outlet 2"])
-        self.assertGreaterEqual(combo.findText("lpa_a"), 0)
-        self.assertIn("lpa_a",
-                      self.widget._parameterNode.GetParameter(_CLIP_POINT_NAME_LIST_PARAMETER))
+    def test_the_table_follows_points_being_added_and_removed(self):
+        self.clipPoints.RemoveNthControlPoint(0)
+        self.assertEqual(self.table.rowCount, 2)
+        self.assertEqual(self.shown(), ["Outlet 1", "Outlet 2"])
 
-        # Offered once, not once per use.
-        self.select(2)
-        combo.currentText = "lpa_a"
-        self.widget.onClipPointNameChosen()
-        offered = [combo.itemText(index) for index in range(combo.count)]
-        self.assertEqual(offered.count("lpa_a"), 1)
+        index = self.clipPoints.AddControlPoint([1.0, 0.0, 0.0])
+        self.clipPoints.SetNthControlPointLabel(index, "IVC")
+        self.widget.rebuildClipPointNamesTable()
+        self.assertEqual(self.table.rowCount, 3)
+        self.assertEqual(self.shown(), ["Outlet 1", "Outlet 2", "IVC"])
 
-    def test_an_empty_box_does_not_unname_a_point(self):
-        """Clearing the box happens on every selection change, so it cannot mean "remove the
-        name" - a point with no label at all is one whose cap arrives unnamed downstream."""
-        combo = self.widget.ui.clipPointNameComboBox
-        self.select(0)
-        combo.currentText = ""
-        self.widget.onClipPointNameChosen()
-        self.assertEqual(self.labels(), ["Inlet", "Outlet 1", "Outlet 2"])
+    def test_selecting_a_row_selects_that_clip_point_in_the_views(self):
+        """Reading a name off a row says nothing about where that vessel end is on the anatomy."""
+        self.clipPoints.CreateDefaultDisplayNodes()
+        self.table.setCurrentCell(2, _CLIP_POINT_NAME_COLUMN)
+        self.widget.onClipPointNameRowSelected()
+        self.assertEqual(self.clipPoints.GetDisplayNode().GetActiveControlPoint(), 2)
 
-    def test_nothing_is_renamed_with_no_point_selected(self):
-        """The handler is reachable while nothing is being edited - the line edit emits
-        editingFinished on focus loss - and must do nothing then."""
-        self.widget.ui.clipPointNameComboBox.currentText = "RSVC"
-        self.widget.onClipPointNameChosen()
-        self.assertEqual(self.labels(), ["Inlet", "Outlet 1", "Outlet 2"])
+    def test_a_different_clip_points_node_rebuilds_the_table(self):
+        other = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "Other points")
+        other.SetNthControlPointLabel(other.AddControlPoint([0.0, 0.0, 0.0]), "aorta")
+        self.widget._parameterNode.SetNodeReferenceID("ClipPoints", other.GetID())
+        self.widget.observeClipPointsNode(other)
+        self.assertEqual(self.shown(), ["aorta"])
 
     def test_capping_the_output_is_off_by_default(self):
         """The usual next step makes the caps itself, past a boundary layer, where they belong.

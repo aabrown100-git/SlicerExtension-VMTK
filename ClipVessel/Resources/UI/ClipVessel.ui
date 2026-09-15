@@ -479,31 +479,42 @@
      </property>
      <layout class="QVBoxLayout" name="verticalLayout_2">
       <item>
-       <layout class="QHBoxLayout" name="clipPointNameRowLayout">
-        <item>
-         <widget class="QLabel" name="clipPointNameLabel">
-          <property name="text">
-           <string>Vessel name:</string>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QComboBox" name="clipPointNameComboBox">
-          <property name="enabled">
-           <bool>false</bool>
-          </property>
-          <property name="editable">
-           <bool>true</bool>
-          </property>
-          <property name="insertPolicy">
-           <enum>QComboBox::NoInsert</enum>
-          </property>
-          <property name="toolTip">
-           <string>The name of the vessel end the selected clip point marks. Click a clip point in a 3D view to select it, then pick a name from the list or type your own; a name you type is added to the list and saved with the scene, so the next case offers it too. This is the name the cap of this end carries downstream - into the volume mesh, the mesh-surfaces file names, and the boundary condition names a solver reports results under - so naming here means not naming again after meshing.</string>
-          </property>
-         </widget>
-        </item>
-       </layout>
+       <widget class="ctkCollapsibleGroupBox" name="clipPointNamesCollapsibleGroupBox">
+        <property name="title">
+         <string>Vessel names</string>
+        </property>
+        <property name="collapsed">
+         <bool>true</bool>
+        </property>
+        <layout class="QVBoxLayout" name="clipPointNamesLayout">
+         <item>
+          <widget class="QLabel" name="clipPointNamesHintLabel">
+           <property name="text">
+            <string>Name each vessel end. These names travel through meshing.</string>
+           </property>
+           <property name="wordWrap">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QTableWidget" name="clipPointNamesTable">
+           <property name="toolTip">
+            <string>Every clip point and the name of the vessel end it marks, in clip point order. Click a name to edit it. These are the names the caps carry downstream - into the volume mesh, the mesh-surfaces file names, and the boundary condition names a solver reports results under - so naming here means not naming again after meshing. Selecting a row also selects that clip point in the 3D views, so you can see which end you are naming.</string>
+           </property>
+           <property name="selectionBehavior">
+            <enum>QAbstractItemView::SelectRows</enum>
+           </property>
+           <property name="selectionMode">
+            <enum>QAbstractItemView::SingleSelection</enum>
+           </property>
+           <property name="minimumHeight">
+            <number>140</number>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
       </item>
       <item>
        <widget class="ctkCollapsibleGroupBox" name="CollapsibleGroupBox_3">
